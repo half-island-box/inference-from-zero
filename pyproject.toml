@@ -12,14 +12,16 @@ readme = "README.md"
 description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.0.0; sys_platform == 'linux'",
+    "torch==2.8.0",
+    "triton==3.4.0; sys_platform == 'linux'",
     "transformers>=4.51.0",
-    "flash-attn>=2.7.0; sys_platform == 'linux'",
-    "safetensors",
-    "numpy",
-    "tqdm",
-    "xxhash",
+    # flash-attn 在 PyPI 上只有 sdist（无预编译 wheel），安装时会在本机源码编译；
+    # 需要 CUDA 12.8 的 nvcc、gcc、ninja。也可改用 Dao-AILab 的预编译 wheel 跳过编译。
+    "flash-attn==2.8.0.post2; sys_platform == 'linux'",
+    "safetensors>=0.4.5",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+    "xxhash>=3.0",
 ]
 
 
