@@ -1,0 +1,71 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 打包 / 安装产物 ----------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# ---------- 测试 / 静态检查缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ---------- 模型权重 / 大文件（开放仓不要提交） ----------
+# 如有需要保留的小样例文件，用 ! 例外，例如：
+# !tests/fixtures/tiny_model.safetensors
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.gguf
+/models/
+/checkpoints/
+
+# ---------- 本地运行产物 ----------
+*.log
+/logs/
+/wandb/
+/runs/
+/outputs/
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# ---------- 环境变量 / 密钥 ----------
+.env
+.env.*
+*.env
+secrets.*
+*.pem
+*.key
+
+# ---------- 编辑器 / 系统 ----------
+.idea/
+.vscode/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+dumps/

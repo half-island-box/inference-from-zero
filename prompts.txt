@@ -1,0 +1,3 @@
+introduce yourself
+list all prime numbers within 100
+explain what a transformer is in one sentence
