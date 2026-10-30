@@ -15,14 +15,28 @@ dependencies = [
     "torch==2.8.0",
     "triton==3.4.0; sys_platform == 'linux'",
     "transformers>=4.51.0",
-    # flash-attn 在 PyPI 上只有 sdist（无预编译 wheel），安装时会在本机源码编译；
-    # 需要 CUDA 12.8 的 nvcc、gcc、ninja。也可改用 Dao-AILab 的预编译 wheel 跳过编译。
-    "flash-attn==2.8.0.post2; sys_platform == 'linux'",
+    # 用 Astral 的 cu128 预编译 wheel（见下方 [[tool.uv.index]]），免去源码编译
+    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
     "safetensors>=0.4.5",
     "numpy>=1.26",
     "tqdm>=4.66",
     "xxhash>=3.0",
 ]
+
+# flash-attn 在 PyPI 上只有源码包，构建时会 import torch，隔离环境里没有 torch 就会失败。
+# 这里改为从 Astral 的 cu128 预编译索引取 wheel（wheel 元数据限定 torch==2.8.*）。
+[[tool.uv.index]]
+name = "astral-cu128"
+url = "https://wheels.astral.sh/simple/cu128/"
+explicit = true
+
+[tool.uv.sources]
+flash-attn = { index = "astral-cu128" }
+
+# 如果访问不了 wheels.astral.sh，删掉上面两段，改用源码编译：
+# [tool.uv.extra-build-dependencies]
+# flash-attn = [{ requirement = "torch", match-runtime = true }, "ninja", "packaging", "psutil"]
+# 需要服务器装有 CUDA 12.8 的 nvcc，并可用 MAX_JOBS=4 限制编译内存。
 
 
 [tool.setuptools.packages.find]
