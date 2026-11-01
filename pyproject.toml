@@ -15,8 +15,8 @@ dependencies = [
     "torch==2.8.0",
     "triton==3.4.0; sys_platform == 'linux'",
     "transformers>=4.51.0",
-    # 用 Astral 的 cu128 预编译 wheel（见下方 [[tool.uv.index]]），免去源码编译
-    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
+    # 预编译 wheel，免去源码编译；轮子本身是 cp312 的，所以限定 3.12
+    "flash-attn==2.8.3; sys_platform == 'linux' and python_version >= '3.12'",
     "safetensors>=0.4.5",
     "numpy>=1.26",
     "tqdm>=4.66",
@@ -24,19 +24,23 @@ dependencies = [
 ]
 
 # flash-attn 在 PyPI 上只有源码包，构建时会 import torch，隔离环境里没有 torch 就会失败。
-# 这里改为从 Astral 的 cu128 预编译索引取 wheel（wheel 元数据限定 torch==2.8.*）。
-[[tool.uv.index]]
-name = "astral-cu128"
-url = "https://wheels.astral.sh/simple/cu128/"
-explicit = true
-
+# 这里直接指向 mjun0812/flash-attention-prebuild-wheels 的预编译轮子：
+#   flash_attn-2.8.3+cu128torch2.8-cp312-cp312-linux_x86_64.whl  (Linux x86_64 / CUDA 12.8 / torch 2.8 / cp312)
+# GitHub release 不是 PEP 503 索引，所以用 url 直连，而不是 [[tool.uv.index]]。
 [tool.uv.sources]
-flash-attn = { index = "astral-cu128" }
+flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu128torch2.8-cp312-cp312-linux_x86_64.whl" }
 
-# 如果访问不了 wheels.astral.sh，删掉上面两段，改用源码编译：
+# 备选方案一：Astral 官方 cu128 预编译索引（覆盖 cp310-cp313，但站点在海外）
+# [[tool.uv.index]]
+# name = "astral-cu128"
+# url = "https://wheels.astral.sh/simple/cu128/"
+# explicit = true
+# [tool.uv.sources]
+# flash-attn = { index = "astral-cu128" }
+#
+# 备选方案二：源码编译（需要 CUDA 12.8 的 nvcc，编译很慢，内存吃紧时用 MAX_JOBS=4）
 # [tool.uv.extra-build-dependencies]
 # flash-attn = [{ requirement = "torch", match-runtime = true }, "ninja", "packaging", "psutil"]
-# 需要服务器装有 CUDA 12.8 的 nvcc，并可用 MAX_JOBS=4 限制编译内存。
 
 
 [tool.setuptools.packages.find]
