@@ -54,12 +54,14 @@ def append_result(row: dict, path: str = RESULTS_CSV) -> None:
 
 def main():
     seed(0)
-    num_seqs = 256
-    max_input_len = 1024
-    max_ouput_len = 1024
+    # 手写 attention 是 eager 模式、显存 O(S²)，先用小规模跑通，确认没问题再逐步加大
+    num_seqs = 16
+    max_input_len = 256
+    max_ouput_len = 128
 
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    # max_model_len 决定 warmup 时假序列的长度：越小 warmup 越快、越省显存
+    llm = LLM(path, enforce_eager=True, max_model_len=1024)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignores_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
@@ -68,7 +70,7 @@ def main():
 
     llm.generate(["Benchmark: "], SamplingParams())
     t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+    llm.generate(prompt_token_ids, sampling_params, use_tqdm=True)
     t = (time.time() - t)
     total_tokens = sum(sp.max_tokens for sp in sampling_params)
     throughput = total_tokens / t

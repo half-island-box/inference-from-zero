@@ -237,13 +237,16 @@ class ModelRunner:
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
 
+        context_lens_list = context_lens  # 保留 CPU 版本给 attention 用，避免每层同步
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    context_lens_list=context_lens_list)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

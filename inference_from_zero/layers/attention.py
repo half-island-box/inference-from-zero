@@ -106,17 +106,40 @@ class Attention(nn.Module):
         return torch.cat(outputs, dim=1)[0]         # [N, H, D]
 
 
+    # decode 时一次处理多少条序列，避免 gather 出来的 K/V 撑爆显存
+    decode_chunk_size = 64
+
     def _decode(self, q: torch.Tensor, context):
         # q: [B, H, D]；本轮新 token 的 KV 已经写进 cache，读整条序列即可
-        outputs = []
-        for i in range(q.size(0)):
-            length = int(context.context_lens[i])
-            ki, vi = self._gather_kv(context.block_tables[i], length)   # [L, Hkv, D]
-            outputs.append(self._attn(q[i].unsqueeze(0).unsqueeze(0),    # [1, 1, H, D]
-                                      ki.unsqueeze(0), vi.unsqueeze(0),
-                                      offset=length - 1))
+        # 注意：长度要用 CPU 上的 python list，逐条 int(GPU tensor) 会触发上万次同步
+        lens = context.context_lens_list
+        if lens is None:
+            lens = context.context_lens.tolist()
 
-        return torch.cat(outputs, dim=1)[0]         # [B, H, D]
+        block_size = self.k_cache.size(1)
+        num_kv_heads, head_dim = self.k_cache.size(2), self.k_cache.size(3)
+
+        outputs = []
+        for s in range(0, q.size(0), self.decode_chunk_size):
+            e = min(s + self.decode_chunk_size, q.size(0))
+            chunk_lens = lens[s:e]
+            num_blocks = (max(chunk_lens) + block_size - 1) // block_size
+
+            # [chunk, num_blocks] -> 展平后一次性把整批 K/V 取出来
+            # [chunk, num_blocks*block_size, Hkv, D]
+            # 短序列的块表右侧是 -1 填充，这些位置会被下面的 valid 掩码屏蔽，
+            # 这里钳到 0 只是为了能合法 index_select
+            block_ids = context.block_tables[s:e, :num_blocks].long().reshape(-1).clamp_(min=0)
+            ki = self.k_cache.index_select(0, block_ids).reshape(e - s, num_blocks * block_size, num_kv_heads, head_dim)
+            vi = self.v_cache.index_select(0, block_ids).reshape(e - s, num_blocks * block_size, num_kv_heads, head_dim)
+
+            # 块是按 num_blocks 对齐取的，超出各自长度的部分是无效填充，用掩码屏蔽
+            valid = (torch.arange(ki.size(1), device=q.device).unsqueeze(0)
+                     < torch.tensor(chunk_lens, device=q.device, dtype=torch.long).unsqueeze(1))
+
+            outputs.append(self._attn(q[s:e].unsqueeze(1), ki, vi, valid_mask=valid))
+
+        return torch.cat(outputs, dim=0).squeeze(1)  # [B, H, D]
 
 
     def _gather_kv(self, block_table: torch.Tensor, length: int):
@@ -133,8 +156,10 @@ class Attention(nn.Module):
         return k, v
 
 
-    def _attn(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, offset: int = 0):
+    def _attn(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+              offset: int = 0, valid_mask: torch.Tensor | None = None):
         # query: [B, Sq, H, D]    key/value: [B, Sk, Hkv, D]
+        # valid_mask: [B, Sk]，True 表示该 key 有效（decode 时用来屏蔽块内 padding）
         B, Sq, H, D_h = query.shape
         Sk = key.size(1)
 
@@ -145,10 +170,15 @@ class Attention(nn.Module):
 
         scores = query @ key.transpose(-2, -1) * self.scale   # [B, Hkv, group, Sq, Sk]
 
-        # 第 i 个 query 只能看到 0..offset+i 的 key（offset 是它前面被缓存的 prefix 长度）
-        rows = torch.arange(Sq, device=query.device).view(-1, 1) + offset
-        cols = torch.arange(Sk, device=query.device).view(1, -1)
-        scores = scores.masked_fill(cols > rows, float("-inf"))
+        if valid_mask is not None:
+            # decode：q 只有一个 token，不需要因果掩码，只要屏蔽块对齐带出来的无效 padding
+            # [B, Sk] -> [B, 1, 1, 1, Sk]
+            scores = scores.masked_fill(~valid_mask[:, None, None, None, :], float("-inf"))
+        else:
+            # prefill：第 i 个 query 只能看到 0..offset+i 的 key（offset 是它前面被缓存的 prefix 长度）
+            rows = torch.arange(Sq, device=query.device).view(-1, 1) + offset
+            cols = torch.arange(Sk, device=query.device).view(1, -1)
+            scores = scores.masked_fill(cols > rows, float("-inf"))
 
         out = F.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype) @ value
         return out.reshape(B, H, Sq, D_h).transpose(1, 2)
