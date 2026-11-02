@@ -79,7 +79,8 @@ class Qwen3DecoderLayer(nn.Module):
         self.mlp=Qwen3MLP(config)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 名字要和 HF checkpoint 对齐：post_attention_layernorm
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 
     def forward(self, positions:torch.Tensor, hidden_state: torch.Tensor,
@@ -93,7 +94,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_state, residual = self.input_layernorm(hidden_state, residual)
 
         hidden_state = self.self_attn(hidden_state, positions, rotary_emb)
-        hidden_state, residual = self.post_layernorm(hidden_state, residual)
+        hidden_state, residual = self.post_attention_layernorm(hidden_state, residual)
         return self.mlp(hidden_state), residual
 
 
