@@ -256,8 +256,14 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-            
+            hidden_states = self.model(input_ids, positions)
+            if is_prefill:
+                # prefill 一次算出所有 token 的 hidden_state，但每条序列只需要最后一个 token 的 logits。
+                # 先挑行再算 lm_head，否则会得到 [N, vocab] 的超大矩阵（且和 temperatures 对不上）。
+                last_idx = get_context().cu_seqlens_q[1:].long() - 1
+                hidden_states = hidden_states[last_idx]
+            return self.model.compute_logits(hidden_states)
+
         else:
             bs = input_ids.size(0)
             context = get_context()
