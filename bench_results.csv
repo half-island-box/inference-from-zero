@@ -1,0 +1,2 @@
+timestamp,gpu_name,gpu_count,gpu_memory_gb,model,torch_version,num_seqs,max_input_len,max_output_len,total_tokens,elapsed_s,throughput_tok_s
+2026-11-02T21:40:16,NVIDIA A10,1,23.7,Qwen3-0.6B,2.13.0+cu130,16,256,128,1862,8.131,229.0
