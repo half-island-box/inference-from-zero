@@ -19,7 +19,9 @@ class ModelRunner:
        hf_config = config.hf_config
 
        self.block_size = config.kvcache_block_size
-       self.enforce_eager = config.enforce_eager
+       # 手写 attention 里有一堆依赖 context_lens 的动态 gather（形状随数据变化），
+       # CUDA Graph 要求形状固定，录不了，所以这里统一走 eager 模式。
+       self.enforce_eager = True
        self.world_size = config.tensor_parallel_size
        self.rank = rank
        self.event = event
