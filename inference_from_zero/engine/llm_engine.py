@@ -104,8 +104,8 @@ class LLMEngine:
             else:
                 decode_throughout = -num_tokens / (perf_counter() - t)
             pbar.set_postfix({
-                "Prefill:" f"{int(prefill_throughout)}tok/s",
-                "Decode:" f"{int(decode_throughout)}tok/s",
+                "Prefill": f"{int(prefill_throughout)}tok/s",
+                "Decode": f"{int(decode_throughout)}tok/s",
             })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
