@@ -131,6 +131,19 @@ def nvtx_fn(name: str | None = None, deep: bool = False):
     return decorator
 
 
+def under_nsys() -> bool:
+    """当前进程是不是被 `nsys profile` 启动的（靠 nsys 注入的 LD_PRELOAD 判断）。
+
+    用途：`--profile` 只是"打开打点"，不负责录制；没有 nsys 父进程时
+    NVTX range 和 cudaProfilerStart 都是空转，不会产生 .nsys-rep。
+    这个判断用来在跑完时给出准确提示，而不是让人以为已经有 trace 了。
+    """
+    preload = os.environ.get("LD_PRELOAD", "").lower()
+    if "nsys" in preload:
+        return True
+    return any(k.startswith("NSYS_") or k.startswith("NSIGHT_") for k in os.environ)
+
+
 def start_capture() -> None:
     """对齐 nsys 的 --capture-range=cudaProfilerApi。
 

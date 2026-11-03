@@ -5,6 +5,49 @@
 
 ---
 
+## 0. 先搞清楚：`--profile` 不等于"开始录制"
+
+两件事是分开的：
+
+| 角色 | 干什么 |
+| --- | --- |
+| `python bench.py --profile` | **只是让被测进程吐数据**：推 NVTX range、在计时区间内调 `cudaProfilerStart/Stop`、统计阶段耗时 |
+| `nsys profile python bench.py --profile` | **才是录制器**：nsys 作为父进程注入 `libnsys_injection`，把 NVTX / CUDA / OS runtime 事件写进 `.nsys-rep` |
+
+所以：
+
+- **只跑 `bench.py --profile` → 不会产生任何 trace 文件**，只会多打印一张阶段耗时表（CPU 墙钟）。
+  `torch.cuda.profiler.start()` 在没有 profiler attach 时是 no-op，NVTX range 也只是推给"不存在的听众"。
+- **必须让 nsys 启动 python**，才看得到 timeline。`scripts/profile.sh` 就是干这个的。
+
+`scripts/profile.sh` 帮你做的事：
+
+1. 检查 `nsys` 是否存在、给出版本提示；
+2. 你没写 `--profile` 时自动补上（避免录出空 trace）；
+3. 拼好推荐的 nsys 参数：`-t cuda,nvtx,osrt --sample=none --cpuctxsw=none
+   --capture-range=cudaProfilerApi --capture-range-end=stop --trace-fork-before-exec=true`；
+4. `mkdir -p profiles/` 并把 trace 输出到 `profiles/iftz_<时间戳>.nsys-rep`；
+5. 跑完自动执行 `nsys stats`，把 **kernel Top、NVTX 汇总、CUDA API 汇总** 三张表直接打到终端；
+6. 告诉你 `.nsys-rep` 路径和 `nsys-ui` 打开命令。
+
+它也接受原样透传 bench 的所有参数：
+
+```bash
+scripts/profile.sh --num-seqs 16 --max-input-len 256 --max-output-len 128 --repeat 1
+```
+
+不想用脚本也可以手敲（见第 2 节）。**不要**直接用 `nsys profile python bench.py`
+（不带 `--profile`）——那样 `capture-range` 等不到 `cudaProfilerStart`，会一直录到进程退出，
+trace 里混满模型加载和 `torch.compile` 编译，很难看。
+
+跑完 bench 时如果没在 nsys 下运行，现在会直接提醒你（靠 `LD_PRELOAD` 里有没有 `nsys` 判断）：
+
+```
+⚠ 当前**没有**在 nsys 下运行：`--profile` 只负责打点与阶段计时，不会产生 .nsys-rep。
+```
+
+---
+
 ## 1. 已经加好的东西
 
 | 位置 | 内容 |

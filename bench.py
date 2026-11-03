@@ -187,11 +187,17 @@ def main():
             with open(args.profile_out, "w", encoding="utf-8") as f:
                 f.write(text + "\n")
             print(f"Phase timing written to {args.profile_out}")
-        print("\n下一步（在装好 nsys 的机器上）：")
-        print("  scripts/profile.sh --num-seqs 16 --max-input-len 256 --max-output-len 128")
-        print("  或手动：nsys profile -t cuda,nvtx,osrt --sample=none --cpuctxsw=none \\")
-        print("      --capture-range=cudaProfilerApi --capture-range-end=stop \\")
-        print("      -o profiles/iftz python bench.py --profile ...")
+        if prof.under_nsys():
+            print("\n已检测到 nsys 注入：trace 会在 nsys 退出后写入 -o 指定的 .nsys-rep。")
+            print("  nsys 的实参里有 --stats=true 时会自动打印 kernel/NVTX/CUDA API 汇总。")
+        else:
+            print("\n⚠ 当前**没有**在 nsys 下运行：`--profile` 只负责打点与阶段计时，"
+                  "不会产生 .nsys-rep。")
+            print("  要录 trace 必须由 nsys 启动进程，二选一：")
+            print("    1) scripts/profile.sh --num-seqs 16 --max-input-len 256 --max-output-len 128")
+            print("    2) nsys profile -t cuda,nvtx,osrt --sample=none --cpuctxsw=none \\")
+            print("         --capture-range=cudaProfilerApi --capture-range-end=stop \\")
+            print("         -o profiles/iftz python bench.py --profile ...")
 
 
 if __name__ == "__main__":
