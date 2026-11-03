@@ -69,3 +69,4 @@ secrets.*
 .DS_Store
 Thumbs.db
 dumps/
+.agt/
