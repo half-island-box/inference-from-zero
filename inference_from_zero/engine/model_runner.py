@@ -9,6 +9,7 @@ from .sequence import Sequence
 from ..models.qwen3 import Qwen3ForCausalLm
 from ..layers.samplers import Sampler
 from ..utils.context import set_context, get_context, reset_context
+from ..utils import profiler as prof
 from ..utils.loader import load_model
 
 
@@ -258,38 +259,48 @@ class ModelRunner:
 #________________ run job ___________________
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        tag = "prefill" if is_prefill else "decode"
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            hidden_states = self.model(input_ids, positions)
+            with prof.phase(f"model/forward:{tag}"):
+                hidden_states = self.model(input_ids, positions)
             if is_prefill:
                 # prefill 一次算出所有 token 的 hidden_state，但每条序列只需要最后一个 token 的 logits。
                 # 先挑行再算 lm_head，否则会得到 [N, vocab] 的超大矩阵（且和 temperatures 对不上）。
-                last_idx = get_context().cu_seqlens_q[1:].long() - 1
-                hidden_states = hidden_states[last_idx]
-            return self.model.compute_logits(hidden_states)
+                with prof.phase("logits/select_last_token"):
+                    last_idx = get_context().cu_seqlens_q[1:].long() - 1
+                    hidden_states = hidden_states[last_idx]
+            with prof.phase(f"model/logits:{tag}"):
+                return self.model.compute_logits(hidden_states)
 
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 找到能覆盖本次decode的batch 的graph
-            graph_vars = self.graph_vars
+            with prof.phase("cudagraph/replay"):
+                graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 找到能覆盖本次decode的batch 的graph
+                graph_vars = self.graph_vars
 
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay() #replay进行decode
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+                graph_vars["input_ids"][:bs] = input_ids
+                graph_vars["positions"][:bs] = positions
+                graph_vars["slot_mapping"].fill_(-1)
+                graph_vars["slot_mapping"][:bs] = context.slot_mapping
+                graph_vars["context_lens"].zero_()
+                graph_vars["context_lens"][:bs] = context.context_lens
+                graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+                graph.replay() #replay进行decode
+            with prof.phase("model/logits:decode"):
+                return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        tag = "prefill" if is_prefill else "decode"
+        with prof.phase(f"run/prepare:{tag}"):
+            input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        with prof.phase(f"run/temperature_h2d:{tag}"):
+            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
+        with prof.phase(f"run/sampler_d2h:{tag}"):
+            token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        with prof.phase(f"run/reset_context:{tag}"):
+            reset_context()
         return token_ids
 
     # 为每个batch大小录制decode使用的cuda graph

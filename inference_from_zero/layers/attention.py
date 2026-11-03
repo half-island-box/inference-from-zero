@@ -4,6 +4,7 @@ from torch import nn
 import triton
 import triton.language as tl
 from inference_from_zero.utils.context import get_context
+from inference_from_zero.utils import profiler as prof
 
 
 @triton.jit
@@ -71,11 +72,14 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         # 新 token 的 KV 先落进分页 cache，后面的注意力直接从 cache 里读
         if k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            with prof.nvtx("attn/store_kvcache", deep=True):
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.is_prefill:
-            return self._prefill(q, k, v, context)
-        return self._decode(q, context) # decode
+            with prof.nvtx("attn/prefill", deep=True):
+                return self._prefill(q, k, v, context)
+        with prof.nvtx("attn/decode", deep=True):
+            return self._decode(q, context) # decode
 
 
     def _prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context):

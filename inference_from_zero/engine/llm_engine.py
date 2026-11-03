@@ -10,6 +10,7 @@ from .sequence import Sequence
 from .model_runner import ModelRunner
 from ..sampling_params import SamplingParams
 from .scheduler import Scheduler
+from ..utils import profiler as prof
 
 class LLMEngine:
 
@@ -58,23 +59,30 @@ class LLMEngine:
 
     # prompt转化为seq，并且加入调度器
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            token_ids = self.tokenizer.encode(prompt)
-        else:
-            token_ids = prompt
-        seq = Sequence(token_ids, sampling_params)
-        self.scheduler.add(seq)
+        with prof.phase("generate/add_request"):
+            if isinstance(prompt, str):
+                token_ids = self.tokenizer.encode(prompt)
+            else:
+                token_ids = prompt
+            seq = Sequence(token_ids, sampling_params)
+            self.scheduler.add(seq)
 
     # 核心方法，进行一轮完整调度：
     # 调度器拿出一组seq
     # model runner将该seqs给模型进行一次prefill/decode 采样后返回每个seq的新token_id
     # 调度器后处理：将每个seq的新tokenid拼接到末尾
     def step(self):
-        seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        with prof.phase("step/schedule"):
+            seqs, is_prefill = self.scheduler.schedule()
+            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+
+        tag = "prefill" if is_prefill else "decode"
+        with prof.phase(f"step/model_run:{tag}"):
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+
+        with prof.phase("step/postprocess"):
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
 
@@ -95,24 +103,26 @@ class LLMEngine:
 
         outputs = {}
         prefill_throughout = decode_throughout = 0
-        while not self.is_finished():
-            t = perf_counter()
-            output, num_tokens = self.step()
+        with prof.nvtx("generate/loop"):
+            while not self.is_finished():
+                t = perf_counter()
+                output, num_tokens = self.step()
 
-            if num_tokens > 0:
-                prefill_throughout = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughout = -num_tokens / (perf_counter() - t)
-            pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughout)}tok/s",
-                "Decode": f"{int(decode_throughout)}tok/s",
-            })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
-                pbar.update(1)
+                if num_tokens > 0:
+                    prefill_throughout = num_tokens / (perf_counter() - t)
+                else:
+                    decode_throughout = -num_tokens / (perf_counter() - t)
+                pbar.set_postfix({
+                    "Prefill": f"{int(prefill_throughout)}tok/s",
+                    "Decode": f"{int(decode_throughout)}tok/s",
+                })
+                for seq_id, token_ids in output:
+                    outputs[seq_id] = token_ids
+                    pbar.update(1)
 
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        with prof.phase("generate/decode_text"):
+            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
  

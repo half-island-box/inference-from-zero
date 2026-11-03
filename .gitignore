@@ -49,6 +49,10 @@ htmlcov/
 /wandb/
 /runs/
 /outputs/
+/profiles/
+*.nsys-rep
+*.ncu-rep
+*.sqlite
 
 # ---------- Jupyter ----------
 .ipynb_checkpoints/

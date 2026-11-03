@@ -8,6 +8,7 @@ from random import randint, seed
 import torch
 
 from inference_from_zero import LLM, SamplingParams
+from inference_from_zero.utils import profiler as prof
 # from vllm import LLM, SamplingParams
 
 RESULTS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_results.csv")
@@ -66,8 +67,24 @@ def parse_args():
                    help="单序列最大长度；0 表示自动取 input+output 上限并向上取整到 256")
     p.add_argument("--repeat", type=int, default=1, help="重复跑几轮，每轮追加一行结果")
     p.add_argument("--seed", type=int, default=0, help="随机种子（第 i 轮用 seed+i）")
-    p.add_argument("--results", default=RESULTS_CSV, help="结果 CSV 路径")
+    p.add_argument("--results", default=None,
+                   help=f"结果 CSV 路径（默认 {os.path.basename(RESULTS_CSV)}）")
+    p.add_argument("--profile", action="store_true",
+                   help="打开 NVTX 打点 + cudaProfilerApi，配合 scripts/profile.sh 用 nsys 录 trace")
+    p.add_argument("--profile-deep", action="store_true",
+                   help="连每层 attention 也打点（trace 会变大，先确认瓶颈大概在哪再用）")
+    p.add_argument("--profile-all", action="store_true",
+                   help="默认只录第 1 轮（capture-range 只能结束一次），开启后录全部轮次")
+    p.add_argument("--profile-out", default="", help="把阶段耗时汇总另存为文本文件")
     args = p.parse_args()
+
+    if args.profile_deep:
+        args.profile = True
+
+    # profile 会拖慢运行，默认不把（偏慢的）结果写进基准 CSV，避免污染纵向对比
+    args.results_explicit = args.results is not None
+    args.results = args.results or RESULTS_CSV
+    args.write_csv = args.results_explicit or not args.profile
 
     assert 1 <= args.min_input_len <= args.max_input_len, "输入长度区间非法"
     assert 1 <= args.min_output_len <= args.max_output_len, "输出长度区间非法"
@@ -96,13 +113,16 @@ def build_workload(args, round_seed: int):
 
 def main():
     args = parse_args()
+    if args.profile:
+        prof.enable(deep=args.profile_deep)
 
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     # enforce_eager=True：手写 attention 有动态 gather/形状，图捕获不了
     llm = LLM(path, enforce_eager=True, max_model_len=args.max_model_len)
 
     # 计时前的 warmup：触发 kernel 编译与显存分配，排除冷启动开销
-    llm.generate(["Benchmark: "], SamplingParams())
+    with prof.nvtx("bench/warmup"):
+        llm.generate(["Benchmark: "], SamplingParams())
 
     total_out = total_in = total_elapsed = 0
     for i in range(args.repeat):
@@ -111,10 +131,20 @@ def main():
         # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
         torch.cuda.synchronize()
+        # 只在录制的那一轮夹住 cudaProfilerApi：nsys 用 --capture-range=cudaProfilerApi
+        # 就只录这一段，warmup 和后面的统计不会进 trace
+        capture = args.profile and (i == 0 or args.profile_all)
+        if capture:
+            prof.start_capture()
+
         t = time.time()
-        llm.generate(prompt_token_ids, sampling_params, use_tqdm=args.repeat == 1)
-        torch.cuda.synchronize()
+        with prof.nvtx(f"bench/round:{i}"):
+            llm.generate(prompt_token_ids, sampling_params, use_tqdm=args.repeat == 1)
+            torch.cuda.synchronize()
         elapsed = time.time() - t
+
+        if capture:
+            prof.stop_capture()
 
         out_tokens = sum(sp.max_tokens for sp in sampling_params)   # 实际生成量（ignores_eos）
         in_tokens = sum(len(p) for p in prompt_token_ids)           # prefill 量
@@ -123,18 +153,19 @@ def main():
               f"time={elapsed:.2f}s throughput={throughput:.1f}tok/s "
               f"total(in+out)={out_tokens + in_tokens} -> {(out_tokens + in_tokens) / elapsed:.1f}tok/s")
 
-        append_result({
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-            **get_gpu_info(),
-            "model": os.path.basename(os.path.normpath(path)),
-            "torch_version": torch.__version__,
-            "num_seqs": args.num_seqs,
-            "max_input_len": args.max_input_len,
-            "max_output_len": args.max_output_len,
-            "total_tokens": out_tokens,
-            "elapsed_s": round(elapsed, 3),
-            "throughput_tok_s": round(throughput, 2),
-        }, args.results)
+        if args.write_csv:
+            append_result({
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                **get_gpu_info(),
+                "model": os.path.basename(os.path.normpath(path)),
+                "torch_version": torch.__version__,
+                "num_seqs": args.num_seqs,
+                "max_input_len": args.max_input_len,
+                "max_output_len": args.max_output_len,
+                "total_tokens": out_tokens,
+                "elapsed_s": round(elapsed, 3),
+                "throughput_tok_s": round(throughput, 2),
+            }, args.results)
 
         total_out += out_tokens
         total_in += in_tokens
@@ -145,7 +176,22 @@ def main():
               f"time={total_elapsed / args.repeat:.2f}s "
               f"throughput={total_out / total_elapsed:.1f}tok/s "
               f"(in+out)={(total_out + total_in) / total_elapsed:.1f}tok/s")
-    print(f"Result appended to {args.results}")
+    if args.write_csv:
+        print(f"Result appended to {args.results}")
+    else:
+        print("已跳过写 CSV（--profile 下吞吐偏低，避免污染基准）；"
+              "需要写请显式传 --results <path>")
+    if args.profile:
+        text = prof.report("bench phase timing (CPU wall time)")
+        if args.profile_out and text:
+            with open(args.profile_out, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            print(f"Phase timing written to {args.profile_out}")
+        print("\n下一步（在装好 nsys 的机器上）：")
+        print("  scripts/profile.sh --num-seqs 16 --max-input-len 256 --max-output-len 128")
+        print("  或手动：nsys profile -t cuda,nvtx,osrt --sample=none --cpuctxsw=none \\")
+        print("      --capture-range=cudaProfilerApi --capture-range-end=stop \\")
+        print("      -o profiles/iftz python bench.py --profile ...")
 
 
 if __name__ == "__main__":
