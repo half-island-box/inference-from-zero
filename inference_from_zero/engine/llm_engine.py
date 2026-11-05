@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -11,6 +11,28 @@ from .model_runner import ModelRunner
 from ..sampling_params import SamplingParams
 from .scheduler import Scheduler
 from ..utils import profiler as prof
+
+
+@dataclass(slots=True)
+class RequestRecord:
+    """一个请求走到终态时的收尾记录（只在出队并释放的那一步生成一次）。"""
+
+    seq_id: int
+    num_prompt_tokens: int
+    num_completion_tokens: int
+    finish_reason: str | None
+
+
+@dataclass(slots=True)
+class StepRecord:
+    """一步调度的记录；空步（只出队/释放）不记。"""
+
+    index: int
+    is_prefill: bool
+    seq_ids: list[int]
+    num_tokens: int
+    finished: list[int]   # 本步 postprocess 判定成终态的 seq_id
+
 
 class LLMEngine:
 
@@ -33,6 +55,12 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+
+        # 观测记录：step_records 每步攒一条（空步不记），request_records 每个请求一条。
+        # 长跑会一直累积，bench / 服务侧需要时自己 clear()。
+        self.step_index = 0
+        self.step_records: list[StepRecord] = []
+        self.request_records: list[RequestRecord] = []
         atexit.register(self.exit)
 
     def _init_single_gpu(self, config):
@@ -67,22 +95,58 @@ class LLMEngine:
             seq = Sequence(token_ids, sampling_params)
             self.scheduler.add(seq)
 
+    def abort_request(self, seq_ids: int | list[int]):
+        """取消 waiting / running 里的请求。
+
+        只把状态打成 FINISHED_ABORTED，不动队列、不释放 block；
+        下一次 step 会把它从队列里出队、写完 RequestRecord、再统一归还 block。
+        """
+        with prof.phase("generate/abort_request"):
+            self.scheduler.abort(seq_ids)
+
     # 核心方法，进行一轮完整调度：
-    # 调度器拿出一组seq
-    # model runner将该seqs给模型进行一次prefill/decode 采样后返回每个seq的新token_id
-    # 调度器后处理：将每个seq的新tokenid拼接到末尾
+    # 1) scheduler 判定哪些序列终态并出队（不释放 block）
+    # 2) model runner 对活着的序列做 prefill/decode 并采样
+    # 3) postprocess 只追加 token、只改状态
+    # 4) 等 run 返回之后，才释放本步出队的终态序列的 block（ZOS 下 GPU 可能还在读）
     def step(self):
         with prof.phase("step/schedule"):
             seqs, is_prefill = self.scheduler.schedule()
-            num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+            num_tokens = (sum(seq.num_scheduled_tokens for seq in seqs)
+                          if is_prefill else -len(seqs))
+            # 先取走，避免 run 期间（将来 ZOS 下）再有人往 finished 里加东西
+            finished = self.scheduler.finished
+            self.scheduler.finished = []
 
-        tag = "prefill" if is_prefill else "decode"
-        with prof.phase(f"step/model_run:{tag}"):
-            token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if seqs:
+            tag = "prefill" if is_prefill else "decode"
+            with prof.phase(f"step/model_run:{tag}"):
+                sampled_token_ids = self.model_runner.call("run", seqs, is_prefill)
 
-        with prof.phase("step/postprocess"):
-            self.scheduler.postprocess(seqs, token_ids, is_prefill)
-            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            with prof.phase("step/postprocess"):
+                self.scheduler.postprocess(seqs, sampled_token_ids, is_prefill)
+                self.step_records.append(StepRecord(
+                    index=self.step_index,
+                    is_prefill=is_prefill,
+                    seq_ids=[seq.seq_id for seq in seqs],
+                    num_tokens=num_tokens,
+                    finished=[seq.seq_id for seq in seqs if seq.is_finished],
+                ))
+
+        # 统一出口：所有终态都在这里归还 block、写 RequestRecord、交给调用方
+        outputs = []
+        for seq in finished:
+            completion_token_ids = seq.completion_token_ids
+            self.scheduler.block_manager.deallocate(seq)
+            self.request_records.append(RequestRecord(
+                seq_id=seq.seq_id,
+                num_prompt_tokens=seq.num_prompt_tokens,
+                num_completion_tokens=len(completion_token_ids),
+                finish_reason=seq.finish_reason,
+            ))
+            outputs.append((seq.seq_id, completion_token_ids, seq.finish_reason))
+
+        self.step_index += 1
         return outputs, num_tokens
 
 
@@ -110,19 +174,26 @@ class LLMEngine:
 
                 if num_tokens > 0:
                     prefill_throughout = num_tokens / (perf_counter() - t)
-                else:
+                elif num_tokens < 0:
                     decode_throughout = -num_tokens / (perf_counter() - t)
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughout)}tok/s",
                     "Decode": f"{int(decode_throughout)}tok/s",
                 })
-                for seq_id, token_ids in output:
-                    outputs[seq_id] = token_ids
+                for seq_id, token_ids, finish_reason in output:
+                    outputs[seq_id] = (token_ids, finish_reason)
                     pbar.update(1)
 
         pbar.close()
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        ordered = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         with prof.phase("generate/decode_text"):
-            outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+            outputs = [
+                {
+                    "text": self.tokenizer.decode(token_ids),
+                    "token_ids": token_ids,
+                    "finish_reason": finish_reason,
+                }
+                for token_ids, finish_reason in ordered
+            ]
         return outputs
  

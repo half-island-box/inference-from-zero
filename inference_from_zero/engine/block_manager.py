@@ -1,8 +1,24 @@
 from collections import deque
+from enum import IntEnum
+
 import xxhash
 import numpy as np
 
 from .sequence import Sequence
+
+
+class AllocStatus(IntEnum):
+    """can_allocate 的三态结果。
+
+    OK     现在放得下
+    LATER  现在放不下，别人释放后能放下（可以等）
+    NEVER  即使 cache 全空也放不下（要直接拒绝，否则会卡死队列）
+    """
+
+    OK = 0
+    LATER = 1
+    NEVER = 2
+
 
 class Block:
 
@@ -62,11 +78,18 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     # 判断空闲的物理块是否支持处理某个seq
-    # 可以命中的前缀缓存块数，不可以则返回-1
-    def can_allocate(self, seq: Sequence) -> int:
+    # 返回三态 + 可以命中的前缀缓存块数：
+    #   OK    现在就需要分配；LATER 别人释放后能分配；NEVER 即使 cache 全空也放不下
+    def can_allocate(self, seq: Sequence) -> tuple[AllocStatus, int]:
+        # 需求本身就是物理上不可能的：decode 至少还要一块，所以用 >=。
+        # 这里用请求需要的总块数（不是扣掉前缀缓存命中后的 num_new_blocks）——
+        # 命中的块也占着 cache。
+        if seq.num_blocks >= len(self.blocks):
+            return AllocStatus.NEVER, 0
+
         h = -1
         num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks #即将要分配的block数量
+        num_new_blocks = seq.num_blocks # 即将要新分配的block数量
 
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
@@ -81,8 +104,8 @@ class BlockManager:
                 num_new_blocks -=1
 
         if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+            return AllocStatus.LATER, 0
+        return AllocStatus.OK, num_cached_blocks
 
     def allocate(self, seq:Sequence, num_cached_blocks: int):
         assert not seq.block_table

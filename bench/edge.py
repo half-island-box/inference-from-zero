@@ -3,8 +3,8 @@
 用法::
 
     python -m bench.edge --case a                  # 短请求、比 KV cache 总容量大 1 个 token 的请求、短请求
-    python -m bench.edge --case b                  # 三个请求跑到第 4 步，running.remove 掉一个（没有 abort 接口）
-    python -m bench.edge --case c --max-tokens 1   # prompt 恰好等于 max_model_len=4096
+    python -m bench.edge --case b                  # 三个请求跑到第 4 步，abort_request 掉一个
+    python -m bench.edge --case c --max-tokens 1   # prompt 在 max_model_len 边界上（超长拒绝 / 截断）
     python -m bench.edge --case c --max-tokens 2
     python -m bench.edge --case all                # 三个 case 各起一个子进程跑
 
@@ -14,9 +14,9 @@
 * ``[EDGE]``  能跑但行为可疑（引擎缺校验 / 缺清理，bench 只负责记录，不算退出失败）
 * ``[FAIL]``  bench 自己的前置假设不成立或进程级异常（退出码 1）
 
-设计取舍：三个 case 都**手动驱动** ``LLMEngine.step()`` 而不是调 ``generate()``，
-因为 generate() 遇到未调度完的请求会直接 ``assert`` / 丢掉结果，bench 需要看清
-每一步调度器到底做了什么。
+设计取舍：三个 case 都**手动驱动** ``LLMEngine.step()`` 而不是调 ``generate()``：
+generate() 看不到每步细节（scheduled / finished / 空步），而这三个 case 要看的
+恰恰是队列、状态和 block 账目。
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ DEFAULT_MODEL = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 
 CASE_TITLES = {
     "a": "短请求 → 比 KV cache 总容量大 1 token 的请求 → 短请求",
-    "b": "三个请求跑到第 4 步，从 running 里硬删一个（没有 abort 接口）",
-    "c": "prompt 恰好等于 max_model_len，看边界上的 block 分配",
+    "b": "三个请求跑到第 4 步，abort 掉 running 里的一个",
+    "c": "prompt 在 max_model_len 边界上：超长拒绝 / 到上限截断",
 }
 
 
@@ -160,7 +160,8 @@ def one_step(llm: LLM):
 
 
 def describe_step(idx: int, num_tokens: int, dt: float) -> str:
-    kind = "prefill" if num_tokens > 0 else "decode"
+    # num_tokens == 0 是空步：schedule() 只把终态出队，没有 forward
+    kind = "prefill" if num_tokens > 0 else ("decode" if num_tokens < 0 else "empty")
     return f"step {idx}: {kind} work={abs(num_tokens)} tok {dt * 1e3:.1f}ms"
 
 
@@ -175,9 +176,10 @@ def drain(llm: LLM, rep: Case, finished: dict, start_step: int = 0,
         outputs, num_tokens, dt = one_step(llm)
         step += 1
         rep.info(describe_step(step, num_tokens, dt))
-        for seq_id, token_ids in outputs:
+        for seq_id, token_ids, finish_reason in outputs:
             finished[seq_id] = token_ids
-            rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok")
+            rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok "
+                     f"finish_reason={finish_reason}")
     return step
 
 
@@ -230,9 +232,10 @@ def case_a(args, rep: Case) -> None:
             break
         steps += 1
         rep.info(describe_step(steps, num_tokens, dt))
-        for seq_id, token_ids in outputs:
+        for seq_id, token_ids, finish_reason in outputs:
             finished[seq_id] = token_ids
-            rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok")
+            rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok "
+                     f"finish_reason={finish_reason}")
 
     rep.info(f"实际跑了 {steps} 步；free blocks {free_before} -> {len(bm.free_block_ids)}")
     for tag, seq, plen in zip(("A(短)", "B(超容量)", "C(短)"), seqs, prompt_lens):
@@ -244,27 +247,33 @@ def case_a(args, rep: Case) -> None:
 
     # 第一条短请求应该能正常跑完
     if seqs[0].is_finished and len(finished.get(seqs[0].seq_id, [])) == args.short_max_tokens:
-        rep.ok(f"第一条短请求正常跑完（{args.short_max_tokens} tok）")
+        rep.ok(f"A(短) 正常跑完（{args.short_max_tokens} tok）")
     else:
-        rep.fail("第一条短请求没有正常跑完")
+        rep.fail("A(短) 没有正常跑完")
 
-    # 超容量请求：can_allocate 永远返回 -1
-    if seqs[1].num_completion_tokens == 0 and seqs[1] in llm.scheduler.waiting:
-        rep.edge(f"超容量请求 seq{seqs[1].seq_id} 永远拿不到 block，"
-                 f"scheduler 在 waiting 队头直接 break（没有拒绝 / 报错路径）")
+    # 超容量请求：NEVER -> FINISHED_IGNORED，走统一出口
+    if seqs[1].is_finished and seqs[1].finish_reason == "prompt_length_exceeded":
+        rep.ok(f"B(超容量) 被拒绝：{seqs[1].status.name} / prompt_length_exceeded，"
+               f"从未分配过 block（block_table={seqs[1].block_table}）")
+    else:
+        rep.fail(f"B(超容量) 没有被拒绝：status={seqs[1].status.name} "
+                 f"reason={seqs[1].finish_reason}")
 
-    # 队头阻塞：后面的短请求本来装得下，但根本没被看到
-    if seqs[2].status.name == "WAITING" and seqs[2].num_completion_tokens == 0:
-        rep.edge(f"第二条短请求 seq{seqs[2].seq_id} 被队头阻塞：prefill 循环遇到装不下的序列就 break，"
-                 f"不再往后看")
+    # 队头阻塞应该消失：prefill 循环对 NEVER 是 continue，会继续看后面的请求
+    if seqs[2].is_finished and len(finished.get(seqs[2].seq_id, [])) == args.short_max_tokens:
+        rep.ok(f"C(短) 正常跑完（{args.short_max_tokens} tok）：队头阻塞消失")
+    else:
+        rep.fail(f"C(短) 没有被调度：status={seqs[2].status.name}")
+
+    if len(bm.free_block_ids) == len(bm.blocks):
+        rep.ok(f"全部 block 已归还（{len(bm.blocks)}/{len(bm.blocks)}）")
+    else:
+        rep.fail(f"block 泄漏：free={len(bm.free_block_ids)} / {len(bm.blocks)}")
 
     if crash is not None:
-        rep.edge(f"step() 抛 {exc_text(crash)} —— 没有「prompt 超出 KV 容量」的提前拒绝，"
-                 f"generate() 会直接崩掉（而不是 ValueError）")
-    elif llm.is_finished() and not seqs[1].is_finished:
-        rep.edge("队列被判定为空，但超容量请求仍未完成（请求被静默丢弃）")
+        rep.fail(f"step() 抛 {exc_text(crash)}")
     elif steps >= args.max_steps:
-        rep.edge(f"{args.max_steps} 步上限到了还没结束（卡死）")
+        rep.fail(f"{args.max_steps} 步上限到了还没结束（卡死）")
 
 
 # --------------------------------------------------------------------------- #
@@ -273,6 +282,7 @@ def case_a(args, rep: Case) -> None:
 def case_b(args, rep: Case) -> None:
     llm = make_engine(args)
     bm = llm.scheduler.block_manager
+    total_blocks = len(bm.blocks)
 
     sp = SamplingParams(temperature=0.6, max_tokens=args.b_max_tokens, ignores_eos=True)
     prompts = [make_tokens(args.b_prompt_len, args.seed * 10 + i) for i in range(3)]
@@ -287,9 +297,10 @@ def case_b(args, rep: Case) -> None:
         for i in range(args.steps_before_remove):
             outputs, num_tokens, dt = one_step(llm)
             rep.info(describe_step(i + 1, num_tokens, dt))
-            for seq_id, token_ids in outputs:
+            for seq_id, token_ids, finish_reason in outputs:
                 finished[seq_id] = token_ids
-                rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok")
+                rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok "
+                         f"finish_reason={finish_reason}")
     except Exception as exc:  # noqa: BLE001
         rep.fail(f"前 {args.steps_before_remove} 步就异常了: {exc_text(exc)}")
         traceback.print_exc()
@@ -297,53 +308,75 @@ def case_b(args, rep: Case) -> None:
 
     if len(llm.scheduler.running) != 3:
         rep.fail(f"第 {args.steps_before_remove} 步后 running 里只剩 {len(llm.scheduler.running)} 条，"
-                 f"没法做删除实验")
+                 f"没法做 abort 实验")
         return
 
-    removed = seqs[1]
-    free_before = len(bm.free_block_ids)
-    blocks_before = list(removed.block_table)
-    llm.scheduler.running.remove(removed)  # 引擎没有 abort 接口，只能这样模拟
-    rep.info(f"running.remove(seq{removed.seq_id})，未 deallocate、未改 status（引擎没有 abort 接口）")
+    target = seqs[1]
+    target_blocks = list(target.block_table)
+    llm.abort_request([target.seq_id])
+    rep.info(f"abort_request([seq{target.seq_id}])：只打 FINISHED_ABORTED，"
+             f"不动队列、不释放 block")
+
+    # 下一步：它应该不再被调度，并且在这个步的末尾被统一释放
+    try:
+        outputs, num_tokens, dt = one_step(llm)
+    except Exception as exc:  # noqa: BLE001
+        rep.fail(f"abort 后第一步异常: {exc_text(exc)}")
+        traceback.print_exc()
+        return
+    steps = args.steps_before_remove + 1
+    rep.info(describe_step(steps, num_tokens, dt))
+    scheduled = llm.step_records[-1].seq_ids if llm.step_records else []
+    if target.seq_id not in scheduled:
+        rep.ok(f"abort 之后第一步的 scheduled_ids 里没有 seq{target.seq_id}")
+    else:
+        rep.fail("被 abort 的请求仍然被调度了")
+    for seq_id, token_ids, finish_reason in outputs:
+        finished[seq_id] = token_ids
+        rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok "
+                 f"finish_reason={finish_reason}")
 
     try:
-        steps = drain(llm, rep, finished, start_step=args.steps_before_remove)
+        steps = drain(llm, rep, finished, start_step=steps)
     except Exception as exc:  # noqa: BLE001
-        rep.fail(f"删除后继续跑异常: {exc_text(exc)}")
+        rep.fail(f"abort 后继续跑异常: {exc_text(exc)}")
         traceback.print_exc()
         return
 
-    rep.info(f"共 {steps} 步；free blocks {free_before} -> {len(bm.free_block_ids)} / 总量 {len(bm.blocks)}")
-    rep.info(f"被删的 seq{removed.seq_id}: tokens={removed.num_tokens} "
-             f"completion={removed.num_completion_tokens} status={removed.status.name} "
-             f"block_table={removed.block_table}")
+    rep.info(f"共 {steps} 步；free blocks {len(bm.free_block_ids)} / 总量 {total_blocks}")
 
-    survivors_ok = all(len(finished.get(s.seq_id, [])) == args.b_max_tokens
-                       for s in (seqs[0], seqs[2]))
-    if survivors_ok:
+    reasons = {r.seq_id: r.finish_reason for r in llm.request_records}
+    if target.seq_id in finished and len(finished[target.seq_id]) == args.steps_before_remove:
+        rep.ok(f"被 abort 的 seq{target.seq_id} 拿到了 {args.steps_before_remove} tok 的结果，"
+               f"finish_reason={reasons.get(target.seq_id)}")
+    else:
+        rep.fail(f"被 abort 的 seq{target.seq_id} 结果不对：completion="
+                 f"{len(finished.get(target.seq_id, []))} reason={reasons.get(target.seq_id)}")
+
+    if len(finished) == 3:
+        rep.ok("3 条请求都拿到了结果（abort 不再是静默丢一条）")
+    else:
+        rep.fail(f"只拿到 {len(finished)} 条结果")
+
+    if all(len(finished.get(s.seq_id, [])) == args.b_max_tokens for s in (seqs[0], seqs[2])):
         rep.ok(f"另外两条请求正常跑完（各 {args.b_max_tokens} tok）")
     else:
         rep.fail("另外两条请求没有正常跑完")
 
-    # 结果少了但没有任何报错
-    if len(finished) == 2 and removed.seq_id not in finished:
-        rep.edge(f"3 条请求只拿到 2 条结果，且无异常、无 abort 信号："
-                 f"generate() 会静默返回少一条的列表")
-
-    # 状态机不自洽
-    if not removed.is_finished and removed not in llm.scheduler.running:
-        rep.edge(f"seq{removed.seq_id} status={removed.status.name} 但已不在 running 里；"
-                 f"is_finished() 只看队列，会认为全部结束")
-
-    # block 泄漏
-    leaked = [b for b in blocks_before if b in bm.used_block_ids]
-    if leaked:
-        rep.edge(f"seq{removed.seq_id} 的 {len(leaked)} 个 block 没归还"
-                 f"（ref_count={[bm.blocks[b].ref_count for b in leaked]}，"
-                 f"free blocks 结束时 {len(bm.free_block_ids)} / {len(bm.blocks)}，"
-                 f"正常应该是 {len(bm.blocks) - len(leaked)}）")
+    if len(bm.free_block_ids) == total_blocks:
+        rep.ok(f"全部 block 已归还（{total_blocks}/{total_blocks}）")
     else:
-        rep.ok("被删序列的 block 已回收")
+        rep.fail(f"block 泄漏：free={len(bm.free_block_ids)} / {total_blocks}")
+
+    if not target_blocks or all(b in bm.free_block_ids for b in target_blocks):
+        rep.ok(f"seq{target.seq_id} 的 {len(target_blocks)} 个 block 已回到 free list")
+    else:
+        rep.fail(f"seq{target.seq_id} 的 block 没有归还：{target_blocks}")
+
+    if len(bm.used_block_ids) + len(bm.free_block_ids) == total_blocks:
+        rep.ok("used ∪ free == 全部 block（没有既不 used 也不 free 的块）")
+    else:
+        rep.fail("block 账目对不上：used ∪ free != 全部 block")
 
 
 # --------------------------------------------------------------------------- #
@@ -353,31 +386,35 @@ def case_c(args, rep: Case) -> None:
     llm = make_engine(args)
     bm = llm.scheduler.block_manager
     mm = llm.model_runner.config.max_model_len
-
-    prompt_len = mm  # prompt 恰好等于 max_model_len
-    if prompt_len % bm.block_size:
-        rep.info(f"注意: prompt={prompt_len} 不是 block_size({bm.block_size}) 的整数倍")
-
+    bs = bm.block_size
     max_tokens = args.max_tokens
     sp = SamplingParams(temperature=0.6, max_tokens=max_tokens, ignores_eos=True)
-    prompt = make_tokens(prompt_len, args.seed)
-    try:
-        llm.add_request(prompt, sp)
-    except Exception as exc:  # noqa: BLE001 - 将来加了长度校验就走这里
-        rep.edge(f"add_request 拒绝了 prompt == max_model_len 的请求: {exc_text(exc)}")
-        return
+
+    # probe 1：prompt == max_model_len，应该入队即拒绝
+    llm.add_request(make_tokens(mm, args.seed), sp)
     seq = llm.scheduler.waiting[-1]
-
-    need_blocks = ceil((prompt_len + max_tokens) / bm.block_size)
-    rep.info(f"prompt={prompt_len} tok == max_model_len({mm})，max_tokens={max_tokens}，"
-             f"最终 {prompt_len + max_tokens} tok")
-    rep.info(f"按最终长度需要 {need_blocks} blocks / 可用 {len(bm.blocks)} blocks；"
-             f"prompt 本身占满 {ceil(prompt_len / bm.block_size)} blocks")
-    if need_blocks > len(bm.blocks):
-        rep.fail("KV cache 装不下这个 case（需要更多 blocks）")
-        return
-
+    rep.info(f"probe 1: prompt={mm} tok == max_model_len({mm})，max_tokens={max_tokens}")
     finished: dict[int, list[int]] = {}
+    drain(llm, rep, finished, max_steps=args.max_steps)
+    if seq.is_finished and seq.finish_reason == "prompt_length_exceeded":
+        rep.ok(f"prompt == max_model_len 入队即被拒绝：{seq.status.name} / "
+               f"prompt_length_exceeded，从未分配 block")
+    else:
+        rep.fail(f"prompt == max_model_len 没有被拒绝：status={seq.status.name} "
+                 f"reason={seq.finish_reason}")
+    if len(bm.free_block_ids) == len(bm.blocks):
+        rep.ok(f"被拒绝的请求没有占用 block（free={len(bm.free_block_ids)}/{len(bm.blocks)}）")
+    else:
+        rep.fail(f"被拒绝的请求泄漏了 block：free={len(bm.free_block_ids)}/{len(bm.blocks)}")
+
+    # probe 2：prompt == max_model_len - 1，生成第 1 个 token 就撞到上限 -> 截断
+    prompt_len = mm - 1
+    llm.add_request(make_tokens(prompt_len, args.seed + 1), sp)
+    seq = llm.scheduler.waiting[-1]
+    rep.info(f"probe 2: prompt={prompt_len} tok == max_model_len-1，max_tokens={max_tokens}；"
+             f"prompt 占 {ceil(prompt_len / bs)} blocks / 可用 {len(bm.blocks)}")
+
+    finished = {}
     crash: Exception | None = None
     step = 0
     while not llm.is_finished() and step < args.max_steps:
@@ -387,36 +424,34 @@ def case_c(args, rep: Case) -> None:
             crash = exc
             break
         step += 1
-        detail = (f"{describe_step(step, num_tokens, dt)} | seq_len={seq.num_tokens} "
-                  f"completion={seq.num_completion_tokens}/{max_tokens} "
-                  f"blocks={'-' if seq.is_finished else len(seq.block_table)} "
-                  f"status={seq.status.name}")
-        rep.info(detail)
-        for seq_id, token_ids in outputs:
+        rep.info(f"{describe_step(step, num_tokens, dt)} | seq_len={seq.num_tokens} "
+                 f"completion={seq.num_completion_tokens}/{max_tokens} "
+                 f"status={seq.status.name}")
+        for seq_id, token_ids, finish_reason in outputs:
             finished[seq_id] = token_ids
-            rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok")
+            rep.info(f"  seq{seq_id} 完成: completion={len(token_ids)} tok "
+                     f"finish_reason={finish_reason}")
 
     if crash is not None:
         rep.fail(f"prefill/decode 异常: {exc_text(crash)}")
         traceback.print_exc()
         return
-    if step == 0:
-        rep.fail("一步都没跑")
-        return
 
     got = finished.get(seq.seq_id, [])
-    if len(got) == max_tokens:
-        rep.ok(f"生成了 {max_tokens} tok（prefill 一步 + decode {max_tokens - 1} 步）")
+    reasons = {r.seq_id: r.finish_reason for r in llm.request_records}
+    if len(got) == 1 and reasons.get(seq.seq_id) == "length":
+        rep.ok(f"生成 1 tok 后撞到 max_model_len 被截断：finish_reason=length，"
+               f"最终长度 {seq.num_tokens}")
     else:
-        rep.fail(f"期望 {max_tokens} tok，实际 {len(got)} tok")
-
-    final_len = seq.num_tokens
-    rep.info(f"最终序列长度 {final_len} tok（prompt {prompt_len} + completion {final_len - prompt_len}）")
-    if final_len > mm:
-        rep.edge(f"最终长度超过 max_model_len 共 {final_len - mm} tok：引擎不校验单序列长度上限，"
-                 f"只在 warmup / CUDA Graph 里把 max_model_len 当预算用")
+        rep.fail(f"期望 1 tok / length，实际 {len(got)} tok / {reasons.get(seq.seq_id)}")
+    if seq.num_tokens > mm:
+        rep.fail(f"最终长度 {seq.num_tokens} 超过 max_model_len({mm})")
     else:
-        rep.ok("没有超过 max_model_len")
+        rep.ok(f"最终长度 {seq.num_tokens} 没有超过 max_model_len({mm})")
+    if len(bm.free_block_ids) == len(bm.blocks):
+        rep.ok(f"全部 block 已归还（{len(bm.blocks)}/{len(bm.blocks)}）")
+    else:
+        rep.fail(f"block 泄漏：free={len(bm.free_block_ids)}/{len(bm.blocks)}")
 
 
 # --------------------------------------------------------------------------- #
@@ -442,7 +477,7 @@ def parse_args(argv=None):
     p.add_argument("--b-prompt-len", type=int, default=300, help="case b 每条 prompt 的长度")
     p.add_argument("--b-max-tokens", type=int, default=16, help="case b 每条请求生成多少 token")
     p.add_argument("--steps-before-remove", type=int, default=4,
-                   help="case b 跑到第几步再删 running 里的序列")
+                   help="case b 跑到第几步再 abort running 里的序列")
     p.add_argument("--max-steps", type=int, default=4096, help="单个 case 的步数上限，防死循环")
     p.add_argument("--seed", type=int, default=0, help="随机种子")
     args = p.parse_args(argv)

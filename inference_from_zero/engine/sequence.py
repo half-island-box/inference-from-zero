@@ -1,15 +1,46 @@
 from copy import copy
-from enum import Enum, auto
+from enum import IntEnum
 from itertools import count
 
 from ..sampling_params import SamplingParams
 
 
+class SequenceStatus(IntEnum):
+    """请求状态机。
 
-class SequenceStatus(Enum):
-    WAITING = auto()
-    RUNNING = auto()
-    FINISHED = auto()
+    终态必须全部排在 RUNNING 之后：is_finished 用序比较（>= FINISHED_STOPPED），
+    中间不能插非终态。本任务只加类型，任务 B/C 再把终态接进调度器。
+
+    照 DeepInfer 的 SequenceStatus（csrc/engine/sequence.hpp）缩成 7 个，
+    去掉这一阶段用不到的 SWAPPED / FINISHED_SO_FAILED / FINISHED_VE_FAILED。
+    """
+
+    WAITING = 0
+    RUNNING = 1
+    FINISHED_STOPPED = 2          # 采样到 eos
+    FINISHED_LENGTH_CAPPED = 3    # 生成到 max_tokens
+    FINISHED_ABORTED = 4          # 客户端取消
+    FINISHED_IGNORED = 5          # 入队即拒绝（prompt 太长 / 永远放不下）
+    FINISHED_PREEMPTED = 6        # 抢占后不再重算（资源不足）
+
+    @property
+    def is_finished(self) -> bool:
+        return self >= SequenceStatus.FINISHED_STOPPED
+
+    @property
+    def finish_reason(self) -> str | None:
+        return FINISH_REASON.get(self)
+
+
+# 终态 -> 回给调用方的结束原因（字符串照 DeepInfer）；非终态不在表里，返回 None
+FINISH_REASON = {
+    SequenceStatus.FINISHED_STOPPED: "stop",
+    SequenceStatus.FINISHED_LENGTH_CAPPED: "length",
+    SequenceStatus.FINISHED_ABORTED: "abort",
+    SequenceStatus.FINISHED_IGNORED: "prompt_length_exceeded",
+    SequenceStatus.FINISHED_PREEMPTED: "insufficient_system_resource",
+}
+
 
 class Sequence:
     block_size = 256
@@ -25,6 +56,9 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids) # 总token数量
         self.num_cached_tokens = 0 # 在KV Cache中的token数量
         self.num_scheduled_tokens = 0 # 本轮调度分配处理的token数
+        # 2.7 ZOS 的架构种子：已经确定要生成、但还没落地的 token，也要按上界占块。
+        # 现在恒为 0，num_blocks 的行为和以前一致。
+        self.total_inflight_tokens = 0
 
         self.is_prefill = True
         self.block_table = []
@@ -41,7 +75,12 @@ class Sequence:
 
     @property
     def is_finished(self):
-        return self.status == SequenceStatus.FINISHED
+        # 用序比较：所有 FINISHED_* 都算结束
+        return self.status >= SequenceStatus.FINISHED_STOPPED
+
+    @property
+    def finish_reason(self) -> str | None:
+        return self.status.finish_reason
 
     @property
     def num_completion_tokens(self):
@@ -55,10 +94,10 @@ class Sequence:
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
 
-    # 向上取整分配block数量
+    # 向上取整分配block数量；inflight token 也按上界占块
     @property
     def num_blocks(self):
-        return (self.num_tokens + self.block_size - 1) // self.block_size
+        return (self.num_tokens + self.total_inflight_tokens + self.block_size - 1) // self.block_size
 
     @property
     def last_block_num_tokens(self):
