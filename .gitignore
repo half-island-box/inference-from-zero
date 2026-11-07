@@ -49,6 +49,7 @@ htmlcov/
 /wandb/
 /runs/
 /outputs/
+/out/
 /profiles/
 *.nsys-rep
 *.ncu-rep
