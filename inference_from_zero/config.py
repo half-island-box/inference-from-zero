@@ -9,6 +9,10 @@ class Config:
     max_num_batched_tokens: int = 16384 # 一个batch的最大token数
     max_num_seqs: int = 512
     max_model_len: int = 4096 # 单序列的最大长度
+    # prefill 节流：每 prefill_attempt_interval 个 decode step 才尝试一次 prefill；
+    # KV block 用量超过 watermark 时先让 decode 跑，给 decode 留追加 block 的空间。
+    prefill_attempt_interval: int = 70
+    prefill_watermark: float = 0.9
 
     gpu_memory_utilization: float = 0.9 # GPU显存利用率
     tensor_parallel_size: int = 1
