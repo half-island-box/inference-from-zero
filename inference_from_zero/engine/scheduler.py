@@ -123,25 +123,37 @@ class Scheduler:
         return schedule_seqs
 
     def _schedule_decode(self) -> list[Sequence]:
-        """从 running 排出一个 decode 步（必要时抢占后面的请求）。"""
+        """从 running 排出一个 decode 步（必要时抢占后面的请求）。
+
+        抢占分两种：踢别人（自己本步照跑）和踢自己（没有 victim 可踢）。
+        踢自己的时候 block 已经归还、block_table 也清空了，本步绝不能再把它当
+        decode 排进来：那样 seq 会同时留在 waiting 和 running，且拿一张空
+        block_table 去 decode（context_lens 远大于块覆盖范围，读越界 KV）；
+        下一次 prefill 尝试点又会因为 block_table 非空跳过 can_allocate，
+        在 prepare_prefill 里 block_table[i] 越界。
+        """
         schedule_seqs: list[Sequence] = []
 
         while self.running and len(schedule_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
 
+            self_preempted = False
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
                     self.preempt(seq)
+                    self_preempted = True
                     break
+            if self_preempted:
+                # 自己已退回 waiting，本步没有它的 decode；继续看下一个
+                continue
 
             seq.num_scheduled_tokens = 1
             seq.is_prefill = False
             self.block_manager.may_append(seq)
             schedule_seqs.append(seq)
 
-        assert schedule_seqs
         self.running.extendleft(reversed(schedule_seqs))
         return schedule_seqs
 
@@ -168,8 +180,11 @@ class Scheduler:
         # 2) 本步不 prefill，或 prefill 没排出东西：走 decode
         if self.running:
             schedule_seqs = self._schedule_decode()
-            self.decode_step += 1
-            return schedule_seqs, False
+            if schedule_seqs:
+                self.decode_step += 1
+                return schedule_seqs, False
+            # running 里的请求全被抢回 waiting 了：本步没有 decode 可跑，
+            # 落到下面按空闲处理，立刻给被抢的请求重新 prefill（recompute）。
 
         # 3) 没有 decode 可保护：即使不在尝试点 / 超过水位线，也不能空转。
         #    空闲例外触发的 prefill 同样要把 decode_step 归零，否则 running
