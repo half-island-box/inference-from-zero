@@ -150,3 +150,52 @@ python -m bench.run --scenario mixed_long_short --trace out/mixed.jsonl
 注意 `--short-max-tokens` 必须大于最后一条长请求的注入步，否则短请求会提前跑完，
 bench 会以 FAIL 退出（长请求没注入全）。无 CUDA / 模型目录不存在时退出码 2；
 bench 自身假设被打破（没到稳态、长请求拿不到 TTFT）时退出码 1。
+
+---
+
+# 场景 bench：`kv_pressure`
+
+这个场景把 KV cache 压满，观察**资源不足时调度器到底在做什么**：
+
+```bash
+python -m bench.run --scenario kv_pressure \
+  --trace out/kv.jsonl --gpu-memory-utilization 0.5
+```
+
+默认构造：
+
+- `--num-requests 512` 条请求同时到达；
+- 每条 prompt `--prompt-len 128` tok；
+- 每条输出在 `--min-output-tokens 768` 到
+  `--max-output-tokens 1024` tok 之间（固定随机种子，`ignore_eos=True`）；
+- `--gpu-memory-utilization 0.5` 只是更快压满 KV；如果仍然放得下，终端会提示
+  预计不会触发抢占，可继续调低该值或直接用 `--kv-blocks` 固定更小容量。
+
+## 重点指标
+
+| 指标 | 说明 |
+| --- | --- |
+| `KV 满步数(free_blocks=0)` | 末态空闲块为 0 的 step 数，并按 decode / prefill / empty 分解 |
+| `抢占 events / requests` | 总 preemption 次数、有多少请求被踢过 |
+| `每次释放 blocks` | 被踢请求当时持有的 KV block 数，可以验证队尾 victim 释放多少空间 |
+| `白算 token` | `scheduled prefill tokens - 首次 prefill tokens`，即 re-prefill 重复计算量 |
+| `白算 / 产出 token` | 白算 token 相对最终 completion token 的倍数 / 百分比 |
+| `TTFT` | 全部、被踢、未被踢三组对比 |
+| `TBT` | 全部、未被踢、跨过自身抢占的 token 间隔三组对比 |
+| `被踢 -> 下一个 token` | 抢占发生到该请求下一个 token 落地的空档 |
+
+预期判断方法：如果抢占发生在请求第一个 token 之后，原定义的 TTFT 不应受后续
+re-prefill 影响；真正变差的是跨过抢占的 TBT / “被踢 -> 下一个 token”。如果某个
+请求在被踢后又反复重算，`白算 / 产出 token` 会明显升高。
+
+## trace 新增事件
+
+除 `meta` / `request` / `preempt` / `step` / `finish` / `summary` 外，
+`kv_pressure` 还会写：
+
+| `type` | 关键字段 |
+| --- | --- |
+| `prefill_event` | `seq_id`、`tokens`、`start_cached_tokens`、`repeat`；用于统计白算 |
+| `step` | 额外带 `used_blocks` / `kv_usage` |
+
+`preempt.held_blocks` 是抢占前该序列实际占用的 block 数。

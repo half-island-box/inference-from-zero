@@ -146,6 +146,14 @@ class RequestStat:
     finish_reason: str | None = None
     preempt_steps: list[int] = field(default_factory=list)
 
+    # kv_pressure 场景专用：schedule() 返回后、postprocess() 清空之前记录。
+    first_prefill_tokens: int = 0
+    scheduled_prefill_tokens: int = 0
+    reprefill_pending: bool = False
+    reprefill_active: bool = False
+    preempt_ts: list[float] = field(default_factory=list)
+    preempt_blocks: list[int] = field(default_factory=list)
+
     @property
     def ttft_ms(self) -> float | None:
         if not self.token_t:
@@ -417,6 +425,412 @@ def _install_kv_block_limit(kv_blocks: int) -> None:
                 layer_id += 1
 
     ModelRunner.allocate_kv_cache = allocate_kv_cache
+
+
+# --------------------------------------------------------------------------- #
+# 场景：kv_pressure
+# --------------------------------------------------------------------------- #
+def summarize_kv_pressure(reqs: dict[int, RequestStat], steps: list[StepStat],
+                          stop_reason: str) -> dict:
+    """统计 KV 压满时的抢占、白算 token、被踢请求的 TTFT / TBT。"""
+    full_steps = [step for step in steps if step.free_blocks == 0]
+    full_kinds = Counter(step.kind for step in full_steps)
+    first_full = full_steps[0].index if full_steps else None
+
+    preempted_reqs = [r for r in reqs.values() if r.preempt_steps]
+    normal_reqs = [r for r in reqs.values() if not r.preempt_steps]
+
+    tbt_buckets: dict[str, list[float]] = {
+        "all": [],
+        "not_preempted": [],
+        "crossing_preempt": [],
+    }
+    for req in reqs.values():
+        for k in range(1, len(req.token_t)):
+            tbt = (req.token_t[k] - req.token_t[k - 1]) * 1e3
+            tbt_buckets["all"].append(tbt)
+            crossed = any(req.token_step[k - 1] < ps <= req.token_step[k]
+                          for ps in req.preempt_steps)
+            if crossed:
+                tbt_buckets["crossing_preempt"].append(tbt)
+            elif not req.preempt_steps:
+                tbt_buckets["not_preempted"].append(tbt)
+
+    ttft_groups: dict[str, list[float]] = {
+        "all": [r.ttft_ms for r in reqs.values() if r.ttft_ms is not None],
+        "preempted": [r.ttft_ms for r in preempted_reqs if r.ttft_ms is not None],
+        "not_preempted": [r.ttft_ms for r in normal_reqs if r.ttft_ms is not None],
+    }
+
+    # 抢占时刻 -> 该请求下一个 token 落地，度量被踢后的服务空档。
+    resume_after_preempt: list[float] = []
+    for req in preempted_reqs:
+        for preempt_t in req.preempt_ts:
+            next_t = next((t for t in req.token_t if t > preempt_t), None)
+            if next_t is not None:
+                resume_after_preempt.append((next_t - preempt_t) * 1e3)
+
+    total_output_tokens = sum(r.completion_tokens for r in reqs.values())
+    first_prefill_tokens = sum(r.first_prefill_tokens for r in reqs.values())
+    scheduled_prefill_tokens = sum(r.scheduled_prefill_tokens for r in reqs.values())
+    wasted_prefill_tokens = max(0, scheduled_prefill_tokens - first_prefill_tokens)
+    preempt_blocks = [n for r in preempted_reqs for n in r.preempt_blocks]
+
+    return {
+        "stop_reason": stop_reason,
+        "engine_steps": len(steps),
+        "requests": {
+            "total": len(reqs),
+            "finished": sum(r.finish_reason is not None for r in reqs.values()),
+            "unfinished": [r.seq_id for r in reqs.values() if r.finish_reason is None],
+            "preempted": len(preempted_reqs),
+            "preempted_seq_ids": sorted(r.seq_id for r in preempted_reqs),
+        },
+        "steps": {
+            "kinds": dict(Counter(s.kind for s in steps)),
+            "duration_ms": {
+                kind: stats([s.duration * 1e3 for s in steps if s.kind == kind])
+                for kind in ("prefill", "decode")
+            },
+            "full": {
+                "steps": len(full_steps),
+                "first_step": first_full,
+                "kinds": dict(full_kinds),
+                "decode": full_kinds["decode"],
+                "prefill": full_kinds["prefill"],
+                "empty": full_kinds["empty"],
+                "scheduled_tokens": {
+                    kind: sum(s.batch_tokens for s in full_steps if s.kind == kind)
+                    for kind in ("prefill", "decode")
+                },
+            },
+        },
+        "preemption": {
+            "events": sum(len(r.preempt_steps) for r in reqs.values()),
+            "requests": len(preempted_reqs),
+            "events_per_preempted_request": stats(
+                [float(len(r.preempt_steps)) for r in preempted_reqs]
+            ),
+            "freed_blocks_per_event": stats([float(n) for n in preempt_blocks]),
+        },
+        "prefill_work": {
+            "first_pass_tokens": first_prefill_tokens,
+            "scheduled_tokens": scheduled_prefill_tokens,
+            "wasted_tokens": wasted_prefill_tokens,
+            "wasted_over_first_pass": (
+                None if not first_prefill_tokens
+                else round(wasted_prefill_tokens / first_prefill_tokens, 4)
+            ),
+            "wasted_per_output_token": (
+                None if not total_output_tokens
+                else round(wasted_prefill_tokens / total_output_tokens, 4)
+            ),
+            "wasted_percent_of_output": (
+                None if not total_output_tokens
+                else round(wasted_prefill_tokens / total_output_tokens * 100, 2)
+            ),
+            "output_tokens": total_output_tokens,
+        },
+        "ttft_ms": {name: stats(values) for name, values in ttft_groups.items()},
+        "tbt_ms": {name: stats(values) for name, values in tbt_buckets.items()},
+        "resume_after_preempt_ms": stats(resume_after_preempt),
+    }
+
+
+def print_kv_pressure_summary(summary: dict, args) -> None:
+    req = summary["requests"]
+    steps = summary["steps"]
+    full = steps["full"]
+    preempt = summary["preemption"]
+    work = summary["prefill_work"]
+
+    print("\n" + "=" * 78)
+    print("kv_pressure 结果")
+    print("=" * 78)
+    print(f"  engine steps={summary['engine_steps']} kinds={steps['kinds']} "
+          f"| requests={req['finished']}/{req['total']} finished "
+          f"| stop={summary['stop_reason']}")
+    print(f"  KV 满步数(free_blocks=0): {full['steps']} "
+          f"first={full['first_step']} kinds={full['kinds']} "
+          f"scheduled_tokens={full['scheduled_tokens']}")
+    for kind in ("prefill", "decode"):
+        duration = steps["duration_ms"][kind]
+        print(f"  {kind} step 耗时: n={duration['n']} "
+              f"p50={_fmt(duration['p50_ms'], 'ms')} "
+              f"p99={_fmt(duration['p99_ms'], 'ms')} "
+              f"max={_fmt(duration['max_ms'], 'ms')}")
+    print(f"  抢占: events={preempt['events']} "
+          f"requests={preempt['requests']}/{req['total']}")
+    if preempt["events"]:
+        per_req = preempt["events_per_preempted_request"]
+        blocks = preempt["freed_blocks_per_event"]
+        print(f"    每个被踢请求 events: mean={_fmt(per_req['mean_ms'])} "
+              f"max={_fmt(per_req['max_ms'])} | "
+              f"每次释放 blocks: p50={_fmt(blocks['p50_ms'])} "
+              f"p99={_fmt(blocks['p99_ms'])}")
+
+    print(f"\n  prefill 工作: first={work['first_pass_tokens']} tok, "
+          f"scheduled={work['scheduled_tokens']} tok, "
+          f"wasted={work['wasted_tokens']} tok")
+    print(f"    白算 / 首次 prefill = {_fmt(work['wasted_over_first_pass'], 'x')}")
+    print(f"    白算 / 产出 token = {_fmt(work['wasted_per_output_token'], ' tok/tok')}"
+          f"（{work['wasted_percent_of_output']}%）")
+
+    print("\n  TTFT（add_request -> 第一个 token）")
+    for name, label in (("all", "全部"), ("preempted", "被踢请求"),
+                        ("not_preempted", "未被踢请求")):
+        row = summary["ttft_ms"][name]
+        print(f"    {label}: n={row['n']} p50={_fmt(row['p50_ms'], 'ms')} "
+              f"p99={_fmt(row['p99_ms'], 'ms')} max={_fmt(row['max_ms'], 'ms')}")
+
+    print("\n  TBT（相邻 token 落地间隔；crossing_preempt 包含请求自身被踢后的空档）")
+    for name, label in (("all", "全部"), ("not_preempted", "未被踢请求"),
+                        ("crossing_preempt", "跨过抢占")):
+        row = summary["tbt_ms"][name]
+        print(f"    {label}: n={row['n']} p50={_fmt(row['p50_ms'], 'ms')} "
+              f"p99={_fmt(row['p99_ms'], 'ms')} max={_fmt(row['max_ms'], 'ms')}")
+    resume = summary["resume_after_preempt_ms"]
+    print(f"  被踢 -> 下一个 token: n={resume['n']} "
+          f"p50={_fmt(resume['p50_ms'], 'ms')} p99={_fmt(resume['p99_ms'], 'ms')} "
+          f"max={_fmt(resume['max_ms'], 'ms')}")
+    print("=" * 78, flush=True)
+
+
+def run_kv_pressure(args) -> int:
+    try:
+        import torch
+    except Exception as exc:  # noqa: BLE001
+        print(f"import torch 失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    if not torch.cuda.is_available():
+        print("需要 CUDA：这个 bench 会真的跑模型（当前 torch 看不到 GPU）",
+              file=sys.stderr)
+        return 2
+    if not os.path.isdir(args.model):
+        print(f"找不到模型目录: {args.model}\n"
+              f"用 --model /path/to/Qwen3-0.6B 指定，或改 DEFAULT_MODEL",
+              file=sys.stderr)
+        return 2
+    if args.kv_blocks > 0:
+        _install_kv_block_limit(args.kv_blocks)
+
+    from inference_from_zero import LLM, SamplingParams
+
+    t0 = time.perf_counter()
+    trace = TraceWriter(args.trace, t0)
+    llm = None
+    try:
+        init_t = time.perf_counter()
+        llm = LLM(
+            args.model,
+            enforce_eager=True,
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=args.max_num_seqs,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            prefill_attempt_interval=args.prefill_attempt_interval,
+            prefill_watermark=args.prefill_watermark,
+        )
+        init_s = time.perf_counter() - init_t
+        sched = llm.scheduler
+        bm = sched.block_manager
+        block_size = bm.block_size
+        num_blocks = len(bm.blocks)
+        capacity = num_blocks * block_size
+
+        min_need_blocks = args.num_requests * ceil(
+            (args.prompt_len + args.min_output_tokens) / block_size
+        )
+        max_need_blocks = args.num_requests * ceil(
+            (args.prompt_len + args.max_output_tokens) / block_size
+        )
+        print(f"  引擎初始化 {init_s:.1f}s | "
+              f"gpu_memory_utilization={args.gpu_memory_utilization} | "
+              f"max_num_seqs={args.max_num_seqs}")
+        print(f"  KV cache: {num_blocks} blocks x {block_size} = {capacity} tokens")
+        print(f"  峰值需求估计: {min_need_blocks}~{max_need_blocks} blocks"
+              f"（{args.num_requests} x prompt {args.prompt_len} + 输出 "
+              f"{args.min_output_tokens}~{args.max_output_tokens} tok）")
+        if max_need_blocks <= num_blocks:
+            print("  ! 按上限估计 KV 足够，可能不会触发 preemption；"
+                  "可降低 --gpu-memory-utilization / --kv-blocks 再压")
+        else:
+            print("  ! 峰值需求超过 KV，预计会出现 preemption / re-prefill")
+
+        trace.emit("meta", at_t=time.perf_counter(), scenario="kv_pressure",
+                   model=args.model, args=vars(args), init_s=round(init_s, 3),
+                   block_size=block_size, num_kv_blocks=num_blocks,
+                   kv_capacity_tokens=capacity, torch=torch.__version__)
+
+        seed(args.seed)
+        output_lens = [randint(args.min_output_tokens, args.max_output_tokens)
+                       for _ in range(args.num_requests)]
+        reqs: dict[int, RequestStat] = {}
+        seqs: dict[int, object] = {}
+        steps: list[StepStat] = []
+        state = {"step": 0}
+
+        for i, output_len in enumerate(output_lens):
+            prompt = make_tokens(args.prompt_len, args.seed + i)
+            sampling = SamplingParams(temperature=0.6, max_tokens=output_len,
+                                      ignores_eos=True)
+            submit_t = time.perf_counter()
+            llm.add_request(prompt, sampling)
+            seq = sched.waiting[-1]
+            req = RequestStat(seq_id=seq.seq_id, role="pressure",
+                              prompt_tokens=args.prompt_len,
+                              max_tokens=output_len, submit_step=0,
+                              submit_t=submit_t, phase="pressure")
+            reqs[seq.seq_id] = req
+            seqs[seq.seq_id] = seq
+            trace.emit("request", at_t=submit_t, seq_id=seq.seq_id,
+                       prompt_tokens=args.prompt_len, max_tokens=output_len)
+
+        orig_preempt = sched.preempt
+        orig_schedule = sched.schedule
+
+        def counted_preempt(seq):
+            req = reqs.get(seq.seq_id)
+            now = time.perf_counter()
+            if req is not None:
+                req.preempt_steps.append(state["step"])
+                req.preempt_ts.append(now)
+                req.preempt_blocks.append(len(seq.block_table))
+                req.reprefill_pending = True
+            trace.emit("preempt", at_t=now, step=state["step"],
+                       seq_id=seq.seq_id, seq_tokens=len(seq),
+                       held_blocks=len(seq.block_table))
+            return orig_preempt(seq)
+
+        orig_postprocess = sched.postprocess
+
+        def instrumented_postprocess(schedule_seqs, token_ids, is_prefill):
+            completed_before_postprocess = {
+                seq.seq_id: seq.num_cached_tokens >= seq.num_tokens
+                for seq in schedule_seqs
+            }
+            result = orig_postprocess(schedule_seqs, token_ids, is_prefill)
+            if is_prefill:
+                for seq in schedule_seqs:
+                    req = reqs.get(seq.seq_id)
+                    if (req is not None and req.reprefill_active
+                            and completed_before_postprocess.get(seq.seq_id, False)):
+                        req.reprefill_active = False
+            return result
+
+        def instrumented_schedule():
+            schedule_seqs, is_prefill = orig_schedule()
+            if is_prefill:
+                for seq in schedule_seqs:
+                    req = reqs.get(seq.seq_id)
+                    if req is None:
+                        continue
+                    num = seq.num_scheduled_tokens
+                    repeat = req.reprefill_pending or req.reprefill_active
+                    if req.reprefill_pending:
+                        req.reprefill_pending = False
+                        req.reprefill_active = True
+                    req.scheduled_prefill_tokens += num
+                    if not repeat:
+                        req.first_prefill_tokens += num
+                    trace.emit("prefill_event", step=state["step"],
+                               seq_id=seq.seq_id, tokens=num,
+                               start_cached_tokens=seq.num_cached_tokens,
+                               repeat=repeat)
+            return schedule_seqs, is_prefill
+
+        sched.preempt = counted_preempt
+        sched.schedule = instrumented_schedule
+        sched.postprocess = instrumented_postprocess
+
+        engine_step = 0
+        stop_reason = "finished"
+        print(f"\n  {args.num_requests} 条请求同时到达；开始手动 step...\n", flush=True)
+        while not llm.is_finished():
+            if engine_step >= args.max_steps:
+                stop_reason = "max_steps"
+                break
+            state["step"] = engine_step
+            prev_records = len(llm.step_records)
+            torch.cuda.synchronize()
+            start_t = time.perf_counter()
+            outputs, num_tokens = llm.step()
+            torch.cuda.synchronize()
+            end_t = time.perf_counter()
+            duration = end_t - start_t
+
+            if len(llm.step_records) > prev_records:
+                scheduled = list(llm.step_records[-1].seq_ids)
+            else:
+                scheduled = []
+            kind = "prefill" if num_tokens > 0 else ("decode" if num_tokens < 0 else "empty")
+            emitted: list[list[int]] = []
+            for sid, seq in seqs.items():
+                n = seq.num_completion_tokens
+                req = reqs[sid]
+                while req.completion_tokens < n:
+                    req.completion_tokens += 1
+                    req.token_t.append(end_t)
+                    req.token_step.append(engine_step)
+                    req.token_phase.append("pressure")
+                    emitted.append([sid, req.completion_tokens])
+
+            finished_ids: list[int] = []
+            for seq_id, token_ids, finish_reason in outputs:
+                req = reqs.get(seq_id)
+                finished_ids.append(seq_id)
+                if req is not None:
+                    req.finish_t = end_t
+                    req.finish_reason = finish_reason
+                    req.completion_tokens = max(req.completion_tokens,
+                                                len(token_ids))
+                    trace.emit("finish", at_t=end_t, seq_id=seq_id,
+                               completion_tokens=len(token_ids),
+                               finish_reason=finish_reason,
+                               preemptions=len(req.preempt_steps))
+
+            step = StepStat(
+                index=engine_step, steady_step=engine_step, phase="pressure",
+                kind=kind, start_t=start_t, end_t=end_t, duration=duration,
+                batch_tokens=abs(num_tokens), scheduled=scheduled,
+                arrivals=[], emitted=emitted, finished=finished_ids,
+                running=len(sched.running), waiting=len(sched.waiting),
+                free_blocks=len(bm.free_block_ids),
+            )
+            steps.append(step)
+            trace.emit(
+                "step", at_t=end_t, step=engine_step, phase="pressure", kind=kind,
+                start_ms=round((start_t-t0)*1e3, 3),
+                duration_ms=round(duration*1e3, 3),
+                batch_tokens=abs(num_tokens), scheduled=scheduled, emitted=emitted,
+                finished=finished_ids, running=step.running,
+                waiting=step.waiting, free_blocks=step.free_blocks,
+                used_blocks=num_blocks-step.free_blocks,
+                kv_usage=round((num_blocks-step.free_blocks)/num_blocks, 4),
+            )
+            engine_step += 1
+
+        trace.emit("end", step=engine_step, stop_reason=stop_reason)
+        summary = summarize_kv_pressure(reqs, steps, stop_reason)
+        trace.emit("summary", scenario="kv_pressure", **summary)
+        print_kv_pressure_summary(summary, args)
+
+        if summary["requests"]["unfinished"]:
+            print("  FAIL: 有请求没拿到结果", file=sys.stderr)
+            return 1
+        if stop_reason != "finished":
+            print(f"  FAIL: 结束原因不是 finished（{stop_reason}）", file=sys.stderr)
+            return 1
+        return 0
+
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n未捕获异常: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        trace.emit("error", error=f"{type(exc).__name__}: {exc}")
+        return 1
+    finally:
+        trace.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -742,8 +1156,8 @@ def parse_args(argv=None):
         description="场景化 bench：混合长短请求下的 TBT / TTFT",
     )
     p.add_argument("--scenario", default="mixed_long_short",
-                   choices=["mixed_long_short"],
-                   help="跑哪个场景（目前只有 mixed_long_short）")
+                   choices=["mixed_long_short", "kv_pressure"],
+                   help="跑哪个场景")
     p.add_argument("--trace", default=None,
                    help="JSONL trace 输出路径，例如 out/mixed.jsonl")
     p.add_argument("--model", default=DEFAULT_MODEL,
@@ -756,6 +1170,21 @@ def parse_args(argv=None):
                    help="一个 batch 的最大序列数")
     p.add_argument("--kv-blocks", type=int, default=0,
                    help="强制指定 KV 块数（0 = 用引擎按显存算的默认值）")
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                   help="GPU 显存利用率（kv_pressure 会传给引擎）")
+
+    p.add_argument("--num-requests", type=int, default=512,
+                   help="kv_pressure：同时到达的请求数")
+    p.add_argument("--prompt-len", type=int, default=128,
+                   help="kv_pressure：每条请求 prompt token 数")
+    p.add_argument("--min-output-tokens", type=int, default=768,
+                   help="kv_pressure：每条请求最小输出 token 数")
+    p.add_argument("--max-output-tokens", type=int, default=1024,
+                   help="kv_pressure：每条请求最大输出 token 数")
+    p.add_argument("--prefill-attempt-interval", type=int, default=70,
+                   help="kv_pressure：每多少个 decode step 尝试 prefill")
+    p.add_argument("--prefill-watermark", type=float, default=0.9,
+                   help="kv_pressure：尝试新 prefill 前的 KV block 水位线")
 
     p.add_argument("--num-short", type=int, default=128, help="短请求条数")
     p.add_argument("--short-prompt-len", type=int, default=128,
@@ -804,6 +1233,27 @@ def parse_args(argv=None):
     if args.max_steps < 1:
         p.error("--max-steps 必须 >= 1")
 
+    if args.scenario == "kv_pressure":
+        if args.num_requests < 1:
+            p.error("--num-requests 必须 >= 1")
+        if args.num_requests > args.max_num_seqs:
+            p.error(f"--num-requests ({args.num_requests}) 超过 "
+                    f"--max-num-seqs ({args.max_num_seqs})")
+        if args.prompt_len < 1 or args.min_output_tokens < 1:
+            p.error("--prompt-len / --min-output-tokens 必须 >= 1")
+        if args.min_output_tokens > args.max_output_tokens:
+            p.error("--min-output-tokens 不能大于 --max-output-tokens")
+        if args.prompt_len + args.max_output_tokens > args.max_model_len:
+            p.error(f"prompt + max output ({args.prompt_len}+"
+                    f"{args.max_output_tokens}) 超过 --max-model-len "
+                    f"{args.max_model_len}")
+        if not 0.0 < args.gpu_memory_utilization <= 1.0:
+            p.error("--gpu-memory-utilization 必须在 (0, 1] 内")
+        if not 0.0 < args.prefill_watermark <= 1.0:
+            p.error("--prefill-watermark 必须在 (0, 1] 内")
+        if args.prefill_attempt_interval < 1:
+            p.error("--prefill-attempt-interval 必须 >= 1")
+
     last_arrival = args.first_arrival_step + (args.num_long - 1) * args.long_every_steps
     if args.short_max_tokens <= last_arrival:
         print(f"  ! --short-max-tokens={args.short_max_tokens} 不足以撑到最后一条"
@@ -821,6 +1271,8 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.scenario == "mixed_long_short":
         return run_mixed_long_short(args)
+    if args.scenario == "kv_pressure":
+        return run_kv_pressure(args)
     raise AssertionError(args.scenario)
 
 
