@@ -149,6 +149,10 @@ class RequestStat:
     # kv_pressure 场景专用：schedule() 返回后、postprocess() 清空之前记录。
     first_prefill_tokens: int = 0
     scheduled_prefill_tokens: int = 0
+    # 第一次被 schedule 进 prefill 批的时刻 / step（准入时刻，None = 从未准入）。
+    # TTFT = 准入等待(admission) + 首 prefill 服务(service) 两段。
+    admission_t: float | None = None
+    admission_step: int | None = None
     reprefill_pending: bool = False
     reprefill_active: bool = False
     preempt_ts: list[float] = field(default_factory=list)
@@ -159,6 +163,20 @@ class RequestStat:
         if not self.token_t:
             return None
         return (self.token_t[0] - self.submit_t) * 1e3
+
+    @property
+    def admission_ms(self) -> float | None:
+        """submit -> 第一次被排进 prefill 批（排队等 KV / 等预填充机会）。"""
+        if self.admission_t is None:
+            return None
+        return (self.admission_t - self.submit_t) * 1e3
+
+    @property
+    def service_ms(self) -> float | None:
+        """第一次被排进 prefill 批 -> 第一个 token 落地（真正的首 token 计算）。"""
+        if self.admission_t is None or not self.token_t:
+            return None
+        return (self.token_t[0] - self.admission_t) * 1e3
 
 
 @dataclass
@@ -488,6 +506,7 @@ def summarize_kv_pressure(reqs: dict[int, RequestStat], steps: list[StepStat],
         },
         "steps": {
             "kinds": dict(Counter(s.kind for s in steps)),
+            "duration_sum_ms": round(sum(s.duration for s in steps) * 1e3, 1),
             "duration_ms": {
                 kind: stats([s.duration * 1e3 for s in steps if s.kind == kind])
                 for kind in ("prefill", "decode")
@@ -532,6 +551,16 @@ def summarize_kv_pressure(reqs: dict[int, RequestStat], steps: list[StepStat],
             "output_tokens": total_output_tokens,
         },
         "ttft_ms": {name: stats(values) for name, values in ttft_groups.items()},
+        # TTFT 拆两段：admission = submit -> 首次被排进 prefill 批（排队 / 等 KV），
+        # service = 那次 prefill 批里真正算出首 token（含被 chunk 切开的后续块）。
+        "ttft_breakdown_ms": {
+            "admission": stats([r.admission_ms for r in reqs.values()
+                                if r.admission_ms is not None]),
+            "service": stats([r.service_ms for r in reqs.values()
+                              if r.service_ms is not None]),
+        },
+        "admission_step": stats([float(r.admission_step) for r in reqs.values()
+                                 if r.admission_step is not None]),
         "tbt_ms": {name: stats(values) for name, values in tbt_buckets.items()},
         "resume_after_preempt_ms": stats(resume_after_preempt),
     }
@@ -582,6 +611,16 @@ def print_kv_pressure_summary(summary: dict, args) -> None:
         row = summary["ttft_ms"][name]
         print(f"    {label}: n={row['n']} p50={_fmt(row['p50_ms'], 'ms')} "
               f"p99={_fmt(row['p99_ms'], 'ms')} max={_fmt(row['max_ms'], 'ms')}")
+    adm = summary["ttft_breakdown_ms"]["admission"]
+    srv = summary["ttft_breakdown_ms"]["service"]
+    print(f"    -- 拆开看: 准入等待 p50={_fmt(adm['p50_ms'], 'ms')} "
+          f"p99={_fmt(adm['p99_ms'], 'ms')} | "
+          f"首 prefill 服务 p50={_fmt(srv['p50_ms'], 'ms')} "
+          f"p99={_fmt(srv['p99_ms'], 'ms')}")
+    if adm["p50_ms"] and srv["p50_ms"]:
+        share = adm["p50_ms"] / (adm["p50_ms"] + srv["p50_ms"]) * 100
+        print(f"    -- 准入占 TTFT 的 {share:.1f}%（这个数大 = 瓶颈在预填充机会，"
+              f"不是首 token 算得慢）")
 
     print("\n  TBT（相邻 token 落地间隔；crossing_preempt 包含请求自身被踢后的空档）")
     for name, label in (("all", "全部"), ("not_preempted", "未被踢请求"),
@@ -722,6 +761,7 @@ def run_kv_pressure(args) -> int:
         def instrumented_schedule():
             schedule_seqs, is_prefill = orig_schedule()
             if is_prefill:
+                now = time.perf_counter()
                 for seq in schedule_seqs:
                     req = reqs.get(seq.seq_id)
                     if req is None:
@@ -731,6 +771,10 @@ def run_kv_pressure(args) -> int:
                     if req.reprefill_pending:
                         req.reprefill_pending = False
                         req.reprefill_active = True
+                    if req.admission_t is None:
+                        # 首次被排进 prefill 批：TTFT 从此处拆开（排队 vs 计算）
+                        req.admission_t = now
+                        req.admission_step = state["step"]
                     req.scheduled_prefill_tokens += num
                     if not repeat:
                         req.first_prefill_tokens += num

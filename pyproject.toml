@@ -21,6 +21,10 @@ dependencies = [
     "xxhash>=3.0",
 ]
 
+# bench 的可选依赖：`python -m bench.sweep --plot` 画曲线时用；引擎本身不需要。
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]
+
 # 注意力用手写实现（inference_from_zero/layers/attention.py），不依赖 flash-attn。
 # 如果以后想换回 flash-attn 提速，需要自行准备匹配当前 torch/CUDA 的预编译 wheel，
 # 或在 [tool.uv.extra-build-dependencies] 里补 torch 后源码编译。

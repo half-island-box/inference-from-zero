@@ -199,3 +199,82 @@ re-prefill 影响；真正变差的是跨过抢占的 TBT / “被踢 -> 下一�
 | `step` | 额外带 `used_blocks` / `kv_usage` |
 
 `preempt.held_blocks` 是抢占前该序列实际占用的 block 数。
+
+## TTFT 拆两段（准入 / 首 prefill）
+
+`kv_pressure` 的 TTFT 里混了"排队等 KV"和"首 prefill 计算"两件事。开着
+`prefill_watermark` 时前者往往是主要项，所以 summary 额外给出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `ttft_breakdown_ms.admission` | `submit` → 第一次被排进 prefill 批（排队等 KV / 等尝试点） |
+| `ttft_breakdown_ms.service` | 那次 prefill 批 → 第一个 token 落地（真算的首 token 成本） |
+| `admission_step` | 第一次被准入时的 engine step 分布，用来看"第几波才被服务" |
+
+`admission` 占 TTFT 的比例大 ⇒ 瓶颈是预填充机会（KV 容量 / 水位线），
+不是首 token 算得慢。这两段由 `bench/run.py` 里对 `scheduler.schedule()` 的
+包装记录，字段落在每个 `RequestStat.admission_t` 上。
+
+---
+
+# 参数扫描：`python -m bench.sweep`
+
+单点结果只能说明"这一组参数下会怎样"，要判断水位线 / 尝试间隔 / KV 容量的
+影响，得跑曲线。`bench/sweep.py` 负责这件事：
+
+```bash
+# 0) 先看要跑哪些配置、命令长什么样（不真跑）
+python -m bench.sweep --dry-run
+
+# 1) 真跑（OAT：baseline + 每条轴单独扫一遍，共 10 个配置）
+python -m bench.sweep --outdir out/sweep --extra "--gpu-memory-utilization 0.5"
+
+# 2) 只重新汇总已有 trace（改列 / 加图不用重跑）
+python -m bench.sweep --from-jsonl 'out/sweep/*.jsonl' --outdir out/sweep --plot
+```
+
+`--plot` 需要 matplotlib（`pip install -e '.[plot]'`）；没装时只跳过画图，
+CSV / markdown 照常输出。
+
+因为 KV block 数在 `LLM` 初始化时就算死、调度器参数在构造时读进 `self`，
+**每个配置必须是独立子进程**，脚本内部就是依次 `subprocess.run`。
+
+默认三条轴（`--axes name=v1,v2,...` 可以覆盖）：
+
+| 轴 | CLI | 默认扫描点 |
+| --- | --- | --- |
+| `kv` | `--kv-blocks` | 250 / 400 / 600 / 900（`0` = 用引擎按显存算） |
+| `watermark` | `--prefill-watermark` | 0.85 / 0.9 / 0.95 / 0.98 |
+| `interval` | `--prefill-attempt-interval` | 10 / 30 / 70 / 140 |
+
+输出（`--outdir`）：
+
+| 文件 | 内容 |
+| --- | --- |
+| `kv_<kv>_wm<wm>_it<it>.jsonl` | 每个配置的原始 trace |
+| `kv_sweep.csv` | 扁平化后的每配置一行，含 summary 全部关键字段 |
+| `kv_sweep.md` | 按轴分组的 markdown 表（`★` 行 = baseline），可直接贴进报告 |
+| `kv_sweep_<axis>.png` | `--plot` 时每个轴一张 2×2 曲线图：prefill 机会 vs 抢占次数、白算%、TTFT 拆段（log）、decode 间隔（log） |
+
+脚本只读 trace 里的 `meta` + `summary` 两条记录，所以旧 trace（没有
+`ttft_breakdown_ms` 的那种）也能一起汇总，缺的列显式为 `—`。
+
+图的四个面板对应四个问题（横轴是正在扫的那个参数）：
+
+1. `prefill step share`（左轴，% ）+ `preemption events`（右轴）：供给够不够；
+2. `wasted prefill tokens / output tokens`：代价有多大；
+3. `TTFT p50` / `admission p50` / `first-prefill service p50`（log）：延迟花在排队还是计算；
+4. `TBT p50 / p99`（未被踢）+ `TBT p50 crossing preempt` + `resume after preempt p50`（log）：
+   稳态 decode 有没有被牺牲。
+
+## 曲线怎么读
+
+* **`prefill%`（prefill 步占比）**：这是"预填充机会"的供给。它掉到 1% 以下时，
+  准入和重算都会排长队，TTFT / 被踢恢复时间会被这一项支配。
+* **`白算%` vs `TBT p99`**：这两列是同一个旋钮的两端。水位线放宽（提高
+  `watermark`）或缩短 `interval` 会让 `prefill%` 变高、`白算%` 变高，但
+  `TBT p99`（未被打断的 decode）通常不变 —— 变的只是抢占频率。
+* **`TTFT p50` 与 `├ 准入`**：如果两者几乎相等，TTFT 就是在"等 KV"，
+  加大 `kv` 才会真正改善；如果 `└ 首prefill` 占比大，才轮到优化 prefill 本身。
+* **`被踢恢复`**：等于被抢占后要等多少个 decode 步；除以 `interval` 就是
+  "要等几个尝试周期才轮到重算"。
