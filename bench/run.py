@@ -129,12 +129,12 @@ class TraceWriter:
 @dataclass
 class RequestStat:
     seq_id: int
-    role: str                 # "short" | "long"
+    role: str                 # "short" | "long" | "pressure"
     prompt_tokens: int
     max_tokens: int
     submit_step: int          # 初始短请求是 -1；长请求是注入前的 engine step
     submit_t: float           # perf_counter
-    submit_phase: str         # "warmup" | "steady"
+    submit_phase: str         # "warmup" | "steady" | "pressure"
 
     # 每个 completion token 的落地时间 / step / 该 step 属于哪个阶段
     token_t: list[float] = field(default_factory=list)
@@ -681,7 +681,7 @@ def run_kv_pressure(args) -> int:
             req = RequestStat(seq_id=seq.seq_id, role="pressure",
                               prompt_tokens=args.prompt_len,
                               max_tokens=output_len, submit_step=0,
-                              submit_t=submit_t, phase="pressure")
+                              submit_t=submit_t, submit_phase="pressure")
             reqs[seq.seq_id] = req
             seqs[seq.seq_id] = seq
             trace.emit("request", at_t=submit_t, seq_id=seq.seq_id,
