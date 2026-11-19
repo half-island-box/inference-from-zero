@@ -9,7 +9,7 @@
 | 阶段 | 状态 | 产物 |
 | --- | --- | --- |
 | 0 环境与黄金基线 | 脚手架完成，待在 GPU 上生成基线 | `tools/` + `tests/` + `experiments/log.md` |
-| 1 最小生成器 | 未开始 | `python/minisgl/` |
+| 1 最小生成器 | 代码与 CPU 测试完成，待在 GPU 上验收 | `python/minisgl/` + `scripts/generate_naive.py` |
 
 ## 环境要求
 
@@ -75,6 +75,29 @@ python tools/bench.py --list
 
 每次实验把日期、commit、配置、数字写入 [experiments/log.md](experiments/log.md)。性能数字必须绑定固定的模型、dtype、负载和 GPU。
 
+## 阶段 1：最小生成器
+
+纯 PyTorch 实现模型前向，**没有 KV Cache**：prefill 后每生成一个 token 都重算整段序列，因此 decode 会随长度明显变慢（阶段 2 的动机）。
+
+```bash
+# CPU 单测：层/权重映射/前向对齐 HF，以及生成语义
+pytest tests/test_model.py tests/test_naive_generate.py -q
+
+# GPU：生成阶段 1 输出并与黄金基线逐 token / logits 对比
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B --model-source modelscope
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/naive/Qwen__Qwen3-0.6B/golden.json
+
+# GPU：端到端验收
+pytest tests/test_naive_generation.py -m "gpu and slow"
+
+# 序列长度增长时单步 decode 的耗时
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
+    --bench-lengths 128,256,512,1024,2048
+```
+
+`scripts/generate_naive.py` 输出的 `golden.json` 与 `logits.npz` 和阶段 0 基线格式一致，可直接用 `tools/compare.py` 回归。
+
 ## 采样语义（后续所有阶段复用）
 
 - 每条请求最多生成 `max_tokens` 个 token；
@@ -85,7 +108,13 @@ python tools/bench.py --list
 ## 目录结构
 
 ```
-python/minisgl/          # 自己的引擎实现（阶段 1 开始）
+python/minisgl/          # 自己的引擎实现
+  core.py                # SamplingParams
+  layers/                # BaseOP、RMSNorm、Linear、RoPE、Attention、Embedding
+  models/                # 配置、Llama/Qwen3、safetensors 权重加载
+  engine/                # greedy 采样与 naive 生成循环
+scripts/
+  generate_naive.py      # 阶段 1 生成/对比/序列长度 benchmark
 tools/
   reference_hf.py        # 黄金基线：greedy 生成 + logits
   compare.py             # 与基线对比（token 精确 / logits 容差）
@@ -97,6 +126,9 @@ tests/
   test_hf_runtime.py     # CPU 小模型解码语义测试
   test_compare.py        # 对比工具单测
   test_workloads.py      # 负载定义单测
+  test_model.py          # 层/模型前向对齐 HF、权重映射（CPU）
+  test_naive_generate.py # naive 生成语义（CPU）
+  test_naive_generation.py # 阶段 1 GPU 验收
 experiments/log.md       # 实验记录
 ```
 

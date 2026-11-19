@@ -42,7 +42,30 @@
 
 ## 阶段 1：最小生成器
 
-（待开始）
+### 2026-11-19 — 代码与 CPU 测试完成（待 GPU 验收）
+
+- commit: 阶段 1 提交（见 `git log`）
+- GPU / 驱动 / torch / transformers: 待填
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bf16（CPU 单测使用 tiny Llama/Qwen3，fp32）
+- 配置: 纯 PyTorch，`F.scaled_dot_product_attention` + causal mask，无 KV Cache；q/k/v 与 gate/up 仅在加载时融合
+- 已完成:
+  - `core.py` / `layers/` / `models/` / `engine/`
+  - `scripts/generate_naive.py`：输出可与 `tools/compare.py` 直接对比的 JSON/NPZ
+- CPU 结果: `pytest tests/test_model.py tests/test_naive_generate.py -q` 全部通过；tiny Llama/Qwen3 前向与 HF fp32 对齐；greedy 输出逐 token 一致
+- 待办（GPU）:
+  1. `python scripts/generate_naive.py --model Qwen/Qwen3-0.6B --model-source modelscope`
+  2. `python tools/compare.py ...`（20 条 prompt 逐 token + logits 容差）
+  3. `pytest tests/test_naive_generation.py -m "gpu and slow"`
+  4. 跑 `--bench-lengths` 填下表
+- 结论: 待 GPU 数字确认后进入阶段 2
+
+| prompt 长度 | prefill 耗时 (ms) | 单步 decode（长度 L+1）(ms) |
+| --- | --- | --- |
+| 128 | | |
+| 256 | | |
+| 512 | | |
+| 1024 | | |
+| 2048 | | |
 
 ## 阶段 2：KV Cache 与批量前向
 

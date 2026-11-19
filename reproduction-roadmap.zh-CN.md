@@ -310,6 +310,69 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all
 - Llama 与 Qwen3 都能生成。
 - 记录一组数据：随着序列长度从 128 增长到 2048，单步 decode 耗时如何增长。这个数字是阶段 2 的动机。
 
+**阶段架构图**
+
+```mermaid
+flowchart TB
+    CFG["models/config.py<br/>ModelConfig.from_hf"] --> BUILD["models/__init__.py<br/>create_model（device + dtype 上下文）"]
+
+    subgraph WEIGHTS["权重加载（CPU → 设备）"]
+        ST["*.safetensors<br/>逐文件流式读取"] --> MAP["models/weight.py<br/>q/k/v → qkv_proj<br/>gate/up → gate_up_proj"]
+        MAP --> LOAD["BaseOP.load_state_dict<br/>严格校验 key / shape / dtype"]
+    end
+    BUILD --> LOAD
+
+    subgraph MODEL["纯 PyTorch 模型（B=1，全序列重算）"]
+        EMB["Embedding"] --> LAYERS
+        subgraph LAYERS["DecoderLayer × N"]
+            N1["RMSNorm"] --> QKV["Linear（qkv_proj）"]
+            QKV --> SPLIT["QKV 拆分"]
+            SPLIT --> QKN["QK Norm（仅 Qwen3）"]
+            QKN --> ROPE["RoPE<br/>rotate_half + cos/sin cache"]
+            ROPE --> SDPA["causal SDPA<br/>GQA repeat_interleave"]
+            SDPA --> OPROJ["o_proj + 残差"]
+            OPROJ --> N2["RMSNorm"]
+            N2 --> MLP["gate_up_proj<br/>silu_and_mul<br/>down_proj"]
+            MLP --> RES["残差"]
+        end
+        RES --> FN["final RMSNorm"]
+        FN --> HEAD["LMHead<br/>tied 时复用 Embedding"]
+    end
+    LOAD --> MODEL
+
+    subgraph LOOP["生成循环"]
+        SP["core.SamplingParams<br/>greedy"] --> GEN["engine/generate.py<br/>naive_generate"]
+        GEN -->|"prefill：1 次全序列前向"| MODEL
+        GEN -->|"每步：拼接新 token + 重算全序列"| MODEL
+        GEN --> OUT["与 golden 同格式的<br/>JSON + logits.npz + 计时"]
+    end
+    OUT --> CMP["tools/compare.py<br/>token 逐字 / logits 容差"]
+```
+
+> 阶段 1 只在**加载时**把 checkpoint 的 q/k/v、gate/up 融合成 `qkv_proj` / `gate_up_proj`，运行时仍是普通 `F.linear`，没有做算子级融合。
+
+**测试命令**
+
+```bash
+# 1. CPU 单测：RoPE / RMSNorm / 前向对齐 HF / 权重融合与严格加载
+pytest tests/test_model.py -q
+
+# 2. CPU 单测：生成循环与 HF greedy 逐 token 一致、EOS 语义
+pytest tests/test_naive_generate.py -q
+
+# 3. GPU：生成阶段 1 输出并与阶段 0 黄金基线对比
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B --model-source modelscope
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/naive/Qwen__Qwen3-0.6B/golden.json
+
+# 4. GPU：端到端验收测试（逐 token + logits 容差）
+pytest tests/test_naive_generation.py -m "gpu and slow"
+
+# 5. 序列长度对单步 decode 耗时的影响（阶段 2 的动机）
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
+    --bench-lengths 128,256,512,1024,2048
+```
+
 **常见坑**
 
 - RMSNorm 的 eps、计算 dtype、weight 初始化位置。
