@@ -42,6 +42,26 @@
 | burst_32 | 32 | 128 | 32 | | | | | |
 | mixed_lengths | 8 | 32–4096 | 16–128 | | | | | |
 
+### 2026-11-20 — bench: short_32, medium_512x8, long_8k, long_32k, shared_prefix_4k, burst_32, mixed_lengths （阶段 0）
+
+- commit: 7ed6b5d
+- GPU / 驱动 / torch / transformers: NVIDIA A10 / driver 550.54.15 / torch 2.3.1+cu121 / transformers 4.55.4
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- 配置: backend=hf, seed=0, warmup=1
+- 负载: short_32, medium_512x8, long_8k, long_32k, shared_prefix_4k, burst_32, mixed_lengths
+
+| 负载 | 请求数 | 输入长度 | 输出长度 | TTFT p50 (ms) | ITL p50 (ms) | ITL p95 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| short_32 | 1 | 32 | 32 | 52.94 | 23.50 | 25.31 | 25.70 | 41.93 | 1.21 |
+| medium_512x8 | 8 | 512 | 64 | 49.36 | 23.71 | 25.20 | 29.70 | 41.63 | 1.29 |
+| long_8k | 1 | 8192 | 32 | 427.72 | 23.69 | 24.15 | 24.45 | 28.04 | 2.40 |
+| long_32k | 1 | 32768 | 16 | 3588.87 | 75.51 | 76.20 | 76.48 | 3.44 | 5.98 |
+| shared_prefix_4k | 2 | 4352 | 32 | 199.48 | 23.57 | 25.22 | 27.88 | 34.94 | 1.84 |
+| burst_32 | 32 | 128 | 32 | 49.15 | 23.77 | 26.67 | 31.64 | 41.21 | 1.22 |
+| mixed_lengths | 8 | 32–4096 | 16–128 | 50.13 | 24.23 | 27.22 | 31.40 | 39.92 | 1.80 |
+
+- 结论 / 下一步: 阶段 0 黄金基线
+
 ## 阶段 1：最小生成器
 
 ### 2026-11-19 — 代码与 CPU 测试完成（待 GPU 验收）
@@ -61,13 +81,37 @@
   4. 跑 `--bench-lengths` 填下表
 - 结论: 待 GPU 数字确认后进入阶段 2
 
+
+
+### 2026-11-20 — naive 生成（无 KV Cache） （阶段 1）
+
+- commit: 7ed6b5d (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA A10 / driver 550.54.15 / torch 2.3.1+cu121 / transformers 4.55.4
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- 配置: max_tokens=32, ignore_eos=False, seed=0, 20 条固定 prompt（raw token ids）
+- 结果: prefill 均值 = 27.51 ms；单步 decode 均值 = 21.66 ms；峰值显存 = 1.25 GB
+
+- 结论 / 下一步: 阶段 1 生成验收
+
+### 2026-11-20 — naive decode 长度扩展 （阶段 1）
+
+- commit: 7ed6b5d (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA A10 / driver 550.54.15 / torch 2.3.1+cu121 / transformers 4.55.4
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- 配置: 无 KV Cache，每步重算全序列；bench_repeats=3
+- 负载: prompt 长度 128, 256, 512, 1024, 2048
+
 | prompt 长度 | prefill 耗时 (ms) | 单步 decode（长度 L+1）(ms) |
 | --- | --- | --- |
-| 128 | | |
-| 256 | | |
-| 512 | | |
-| 1024 | | |
-| 2048 | | |
+| 128 | 139.41 | 21.64 |
+| 256 | 21.96 | 21.11 |
+| 512 | 22.17 | 21.57 |
+| 1024 | 35.34 | 37.08 |
+| 2048 | 74.88 | 76.47 |
+
+- 结论 / 下一步: 待填
+
+
 
 ## 阶段 2：KV Cache 与批量前向
 
