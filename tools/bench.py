@@ -14,6 +14,7 @@ bench_load便利load中每个seq进行bench_request
     python tools/bench.py --model Qwen/Qwen3-0.6B --load short_32
     python tools/bench.py --model Qwen/Qwen3-0.6B --load all
     python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stage 2
+    （--log-stage 支持 0–12 任一阶段，记录插入 log.md 对应小节）
 """
 
 from __future__ import annotations
@@ -68,7 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--log-stage",
         type=int,
         default=None,
-        help="记录所属阶段编号，必须与 --append-log 一起使用",
+        help="记录所属阶段编号（0–12），必须与 --append-log 一起使用",
     )
     parser.add_argument("--log-note", default="待填", help="记录中的“结论 / 下一步”")
     return parser.parse_args(argv)

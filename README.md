@@ -65,7 +65,8 @@ python tools/compare.py \
 python tools/bench.py --model Qwen/Qwen3-0.6B --load short_32
 python tools/bench.py --model Qwen/Qwen3-0.6B --load all
 python tools/bench.py --list
-# 跑完自动追加一条记录到 experiments/log.md 的阶段 2 小节
+# 任意阶段（0–12）收尾时，把本轮结果追加到 experiments/log.md 对应阶段小节
+python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stage 0
 python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stage 2
 ```
 
@@ -77,7 +78,7 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stag
 
 每次实验把日期、commit、配置、数字写入 [experiments/log.md](experiments/log.md)。性能数字必须绑定固定的模型、dtype、负载和 GPU。
 
-`--append-log --log-stage N` 会自动收集日期、`git` commit（工作区脏时标注 `dirty`）、GPU 型号/驱动、torch / transformers 版本与该轮所有负载的指标，插入日志中 `## 阶段 N` 小节的末尾；小节不存在时在文末新建。`--log-note` 可填写「结论 / 下一步」，不填则留 `待填`。
+`--append-log --log-stage N`（N 为 0–12 中任一阶段编号）会自动收集日期、`git` commit（工作区脏时标注 `dirty`）、GPU 型号/驱动、torch / transformers 版本与该轮所有负载的指标，插入日志中 `## 阶段 N` 小节的末尾；该小节不存在时在文末新建。`--log-note` 可填写「结论 / 下一步」，不填则留 `待填`。
 
 ## 阶段 1：最小生成器
 

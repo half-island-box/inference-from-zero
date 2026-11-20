@@ -57,7 +57,7 @@ python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
                         --actual   out/run/golden.json
 python tools/bench.py --model Qwen/Qwen3-0.6B --load all
 python tools/bench.py --list
-# 跑完自动把记录追加到 experiments/log.md 的「## 阶段 N」小节
+# 跑完自动把记录追加到 experiments/log.md 的「## 阶段 N」小节（N 可为 0–12 任一阶段）
 python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stage 2 --log-note "…"
 
 black . && ruff check . --fix && mypy python/minisgl   # 与参考仓库一致的 lint 栈

@@ -2,7 +2,7 @@
 
 每次实验追加一条记录。所有性能数字必须绑定：日期、commit、GPU 型号、模型、dtype、固定负载、配置开关。
 
-`python tools/bench.py ... --append-log --log-stage N` 会自动生成本模板中的大部分字段并插入对应阶段小节；「结论 / 下一步」用 `--log-note` 填写，也可事后手改。
+`python tools/bench.py ... --append-log --log-stage N`（N 为 0–12 任一阶段编号）会自动生成本模板中的大部分字段并插入对应阶段小节；「结论 / 下一步」用 `--log-note` 填写，也可事后手改。
 
 ## 记录模板
 
