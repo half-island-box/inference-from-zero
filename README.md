@@ -26,7 +26,7 @@ uv pip install -e ".[dev]"
 python -c "import torch; print(torch.cuda.get_device_name(0))"
 ```
 
-HF 下载受限时加 `--model-source modelscope`（需要 `uv pip install -e ".[modelscope]"`）。
+模型默认从 ModelScope 下载（`uv pip install -e ".[dev]"` 已包含 `modelscope`）；如需改用 HuggingFace，加 `--model-source huggingface`。
 
 ## 阶段 0：黄金基线
 

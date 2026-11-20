@@ -34,12 +34,12 @@ from tools.workloads import PROMPTS
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HF model id or local path")
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="model id or local path")
     parser.add_argument(
         "--model-source",
-        choices=("huggingface", "modelscope"),
-        default="huggingface",
-        help="where to download the model from",
+        choices=("modelscope", "huggingface"),
+        default="modelscope",
+        help="where to download the model from (default: modelscope)",
     )
     parser.add_argument("--output", type=Path, default=None, help="output directory")
     parser.add_argument("--device", default="cuda", help="torch device (default: cuda)")

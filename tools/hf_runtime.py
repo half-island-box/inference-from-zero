@@ -54,7 +54,7 @@ def load_hf_runtime(
     model_name: str,
     dtype: str = "bfloat16",
     device: str = "cuda",
-    model_source: str = "huggingface",
+    model_source: str = "modelscope",
     attn_implementation: str | None = None,
 ) -> HFRuntime:
     """以推理模式加载 HF 因果语言模型。

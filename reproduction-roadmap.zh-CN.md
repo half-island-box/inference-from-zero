@@ -35,7 +35,7 @@ uv pip install -e ".[dev]"
 python -c "import torch; print(torch.cuda.get_device_name(0))"
 ```
 
-> 如果 HuggingFace 下载受限，使用 `--model-source modelscope`。
+> 模型默认从 ModelScope 下载；如需改用 HuggingFace，使用 `--model-source huggingface`。
 
 ### 0.2 七条复现原则
 

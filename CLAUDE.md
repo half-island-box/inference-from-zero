@@ -21,7 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 运行时**必须** Linux + NVIDIA GPU：`sgl_kernel`、`flashinfer`、`tvm-ffi` JIT 都依赖 CUDA，macOS/Windows 原生不行。参考仓库根目录有 `Dockerfile`。
 - 本工作区是 macOS：可以写代码、跑纯 CPU 逻辑和 lint，但任何 `import torch` + CUDA kernel 的验证都要在 GPU 机器/容器上执行。
 - Python 3.10–3.12，包管理用 `uv`。
-- 首个目标模型：`Qwen/Qwen3-0.6B`（bf16，GQA + QK Norm）。HF 下载受限时加 `--model-source modelscope`。
+- 首个目标模型：`Qwen/Qwen3-0.6B`（bf16，GQA + QK Norm）。默认从 ModelScope 下载；如需改用 HuggingFace，加 `--model-source huggingface`。
 - 阶段 6 之前 prompt 一律用 **raw token ids**，不套 chat template；chat template 留到服务化阶段单独验证。
 
 ## 目录结构（路线图 §0.3）
