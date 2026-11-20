@@ -15,7 +15,7 @@ class Embedding(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_ids, self.weight)
 
-
+# 最后一个layer的hidden state -> logits
 class LMHead(BaseOP):
     def __init__(
         self,

@@ -1,7 +1,7 @@
 """模块基类与严格 state_dict 协议。
 
-约定：张量参数直接作为普通属性保存，嵌套模块也是普通属性。``state_dict`` 按
-属性名递归拼接 key，因此属性名就是权重 key 的一部分。
+约定：张量参数直接作为普通属性保存，嵌套模块也是普通属性。
+``state_dict`` 按属性名递归拼接 key，因此属性名就是权重 key 的一部分。
 
 加载结束时若仍有未消费的 key 直接报错，用来尽早暴露权重映射错误。
 """
@@ -19,7 +19,7 @@ _STATE_DICT = dict[str, torch.Tensor]
 def _concat_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
-
+# 基础操作类
 class BaseOP:
     @abstractmethod
     def forward(self, *args: Any, **kwargs: Any) -> Any: ...

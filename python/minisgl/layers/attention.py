@@ -39,7 +39,7 @@ class AttentionLayer(StateLessOP):
 
     def forward(self, qkv: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = qkv.shape
-        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
+        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1) # split成三个矩阵
         q = q.view(batch, seq_len, self.num_qo_heads, self.head_dim)
         k = k.view(batch, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch, seq_len, self.num_kv_heads, self.head_dim)

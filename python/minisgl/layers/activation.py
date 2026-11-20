@@ -10,7 +10,7 @@ def _and_mul(x: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
     return act * x[..., x.shape[-1] // 2 :]
 
 
-def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor: # swiGLU：silu门控制 + value
     return _and_mul(x, F.silu(x[..., : x.shape[-1] // 2]))
 
 

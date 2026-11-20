@@ -42,7 +42,7 @@ python -c "import torch; print(torch.cuda.get_device_name(0))"
 1. **先正确，后性能。** 任何优化之前，必须有一个可信的"黄金输出"作为裁判。
 2. **一次只引入一个优化。** 每加一个特性，都要能单独关闭它并量化差异（ablation），否则你无法解释收益来源。
 3. **每个阶段保持系统可运行。** 不要连续两周处于"编译不过/跑不起来"的状态。
-4. **接口先行。** 先把 `BaseOP`、`BaseAttnBackend`、`BasePrefixCache` 这类接口定下来，再填实现。这样后面替换 kernel 或后端时不用重写业务逻辑。
+4. **接口先行。** 先把 `BaseAttnBackend`、`BasePrefixCache`、`BaseKVCachePool` 这类接口定下来，再填实现。阶段 1 的 `BaseOP` 只是教学用的过渡抽象，阶段 2 会统一迁移到 `nn.Module`（见阶段 2 第 0 步），业务接口不变。
 5. **先用 PyTorch 参考实现，再替换高效实现。** `store_kv` 可以先用 `index_copy_`，RoPE 可以先用 torch，attention 可以先用 SDPA。正确性对齐后再换 FlashAttention / FlashInfer / 自定义 CUDA kernel。
 6. **不要过早抽象，也不要过早优化。** 单请求阶段不需要 paged KV；单卡阶段不需要 TP 代码路径，但接口要预留。
 7. **读代码要有边界。** 每个阶段只读对应模块和对应文档，先画数据流，再看实现细节。
@@ -104,7 +104,7 @@ core → layers → models → kvcache → attention → scheduler → engine �
 | --- | --- | --- | --- | --- | --- |
 | 0 | 环境与黄金基线 | 没有"对错"标准 | 测试与基准脚手架 | 可复现的 HF 基线 | 必做 / 2–3 天 |
 | 1 | 最小生成器 | 模型怎么跑起来 | `layers`、`models`、`core.SamplingParams` | 单请求逐 token 生成 | 必做 / 5–8 天 |
-| 2 | KV Cache 与批量前向 | decode 每步重算全部 K/V；只能单请求 | `core`、`kvcache`、`attention` 基础、页表 | 带缓存的多请求 batch | 必做 / 7–10 天 |
+| 2 | KV Cache 与批量前向 | decode 每步重算全部 K/V；只能单请求 | `core`、`kvcache`、`attention` 基础、页表、`nn.Module` 迁移 | 带缓存的多请求 batch | 必做 / 7–10 天 |
 | 3 | 连续批处理调度器 | 请求动态到达，静态 batch 浪费 | `scheduler`、`engine`、`llm`、Sampler | 单进程并发 LLM 服务 | 必做 / 5–7 天 |
 | 4 | 分块预填充 | 长 prompt 撑爆预算、阻塞 decode | `ChunkedReq`、`PrefillAdder` | 长上下文稳定服务 | 必做 / 3–4 天 |
 | 5 | 前缀缓存 | 重复前缀重复计算、重复占显存 | `radix_cache`、`CacheManager` | 共享前缀加速 + 淘汰 | 必做 / 5–7 天 |
@@ -278,7 +278,7 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all
 | 模块 | 职责 | 参考文件 |
 | --- | --- | --- |
 | `core.py` | `SamplingParams`：temperature / top_k / top_p / ignore_eos / max_tokens | `python/minisgl/core.py` |
-| `layers/base.py` | `BaseOP`：`state_dict` / `load_state_dict` 协议；`StateLessOP`；`OPList` | `python/minisgl/layers/base.py` |
+| `layers/base.py` | `BaseOP`：`state_dict` / `load_state_dict` 协议；`StateLessOP`；`OPList`（阶段 2 第 0 步迁移到 `nn.Module` 后删除） | `python/minisgl/layers/base.py` |
 | `layers/norm.py` | RMSNorm（先用 torch 实现） | `python/minisgl/layers/norm.py` |
 | `layers/linear.py` | 普通 Linear（暂不做 TP） | `python/minisgl/layers/linear.py` |
 | `layers/rotary.py` | RoPE：预计算 cos/sin cache，按 positions 应用 | `python/minisgl/layers/rotary.py` |
@@ -295,7 +295,7 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all
 
 **关键设计点**
 
-1. **state_dict 协议要严格。** `load_state_dict` 结束时如果还有剩余 key，直接报错。这是发现权重映射错误最快的方式。
+1. **state_dict 协议要严格。** `load_state_dict` 结束时如果还有剩余 key，直接报错。这是发现权重映射错误最快的方式。阶段 2 迁移到 `nn.Module` 后，用 `strict=True` + dtype pre-hook + key 集合 diff 保留同样的严格性。
 2. **模型结构先做 Llama，再做 Qwen3。** Llama 无 bias、无 QK Norm；Qwen3 增加 per-head QK Norm。按这个顺序能清晰看到差异。
 3. **RoPE 方向。** HuggingFace 使用 `rotate_half`（前后半轴旋转），不是相邻元素交错。用固定 position 的数值对比 HF 验证。
 4. **GQA。** `num_kv_heads < num_qo_heads` 时，KV 头需要广播到对应的 Q 头；映射关系是整除分组，不是取模。
@@ -350,6 +350,8 @@ flowchart TB
 ```
 
 > 阶段 1 只在**加载时**把 checkpoint 的 q/k/v、gate/up 融合成 `qkv_proj` / `gate_up_proj`，运行时仍是普通 `F.linear`，没有做算子级融合。
+>
+> **过渡说明**：`BaseOP` / `StateLessOP` / `OPList` 是阶段 1 为了显式化权重协议而写的教学抽象。阶段 2 第 0 步会把模型层统一迁移到 `torch.nn.Module`，并删除这套自定义协议；阶段 1 的全部测试保留为迁移的回归基线。
 
 **测试命令**
 
@@ -394,10 +396,75 @@ python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
 
 **为什么在这个阶段**：阶段 1 的瓶颈是"重复计算"。KV Cache 解决重复计算，但一旦缓存跨请求共享，就必须回答"每个请求的 K/V 存在哪里、如何定位、如何回收"。分页（paged）是标准答案。
 
+#### 阶段 2 第 0 步：迁移到 `nn.Module`（必做）
+
+阶段 1 用 `BaseOP` / `StateLessOP` / `OPList` 把权重协议显式化，作为教学和严格校验的手段。这个抽象只覆盖推理所需的一小部分 `nn.Module` 能力，代价是丢失 PyTorch 生态（`torch.compile`、量化、分布式工具、`state_dict` 工具），后续 TP / MoE 还要反复手写递归加载。**阶段 2 的第一件事是完成迁移，完成后再进入下面的 5 个功能小步；之后所有阶段统一基于 `nn.Module`，不再维护两套模块系统。**
+
+#### 迁移目标
+
+- 模型层统一继承 `torch.nn.Module`；权重用 `nn.Parameter(..., requires_grad=False)`，非持久缓存用 `register_buffer(..., persistent=False)`。
+- 保留阶段 1 的严格性：缺 key、多 key、shape 不符、dtype 不符仍然立即失败；tied embedding 不重复加载。
+- `forward` 签名和数值输出不变；阶段 1 的 CPU/GPU 回归测试原样通过。
+- 迁移本身不要求启用 `torch.compile`；只要求模型不再依赖自定义属性遍历，后续可单独评估 compile。
+- 不保留 BaseOP 与 `nn.Module` 的运行时双路径；回退点是阶段 1 的 tag/分支（如 `v0.1-minimal-generator`），迁移期间每个小步都必须能通过阶段 1 测试。
+
+#### 迁移步骤（每步保持可运行）
+
+1. **叶子层**：`RMSNorm`、`Linear`、`Embedding`、`LMHead`、`RotaryEmbedding` 改为 `nn.Module`。RoPE 的 cos/sin 用 `register_buffer(persistent=False)`；tied `LMHead` 不注册独立 `weight`，`forward` 复用 `embedding.weight`。
+2. **复合层**：`GatedMLP`、`RopeAttn`、`DecoderLayer`、`LlamaModel` / `Qwen3Model`、`*ForCausalLM` 改为 `nn.Module`；层列表用 `nn.ModuleList`。**QK Norm 移到 `AttentionLayer` 内部**，避免同一个子模块同时挂在 `RopeAttn` 和 `AttentionLayer` 下导致 state_dict 出现重复 key；`weight.py` 相应增加 `self_attn.q_norm` → `self_attn.attn.q_norm`、`self_attn.k_norm` → `self_attn.attn.k_norm` 的 key 映射；现有的 q/k/v → `qkv_proj`、gate/up → `gate_up_proj` 融合映射保持不变。
+3. **构造与加载**：`create_model` 在 `meta` device + 目标 dtype 下构造；用 `model.load_state_dict(sd, strict=True, assign=True)` 安装流式加载的张量。`RotaryEmbedding` 的 non-persistent buffer 在构造时显式放到目标 device（不跟随 meta 上下文），或在 `to_empty` 后重新生成 cos/sin；**不能留在 meta**。
+4. **清理**：删除 `BaseOP` / `StateLessOP` / `OPList` 和自定义 `state_dict` / `load_state_dict`；`models/base.py` 的 `BaseLLMModel` 改为 `nn.Module` 子类，只保留 `forward` 抽象。更新所有 import、测试和 README。
+
+#### `nn.Module` 注册陷阱（与 BaseOP 的关键差异）
+
+- `BaseOP` 用下划线前缀跳过属性；`nn.Module` **不跳过**。`self._tied_embedding = embedding` 或 `self._rope = rope` 仍会被注册为子模块，导致 state_dict 出现多余 key，或同一个模块被多个父模块持有。
+- 需要"只引用、不注册"时，用 `object.__setattr__(self, "_ref", obj)`，或把引用放进普通 tuple / list（容器本身不是 Module / Parameter / Tensor）。
+- tied `LMHead`：推荐保存 `embedding.weight` 的非注册引用（或 embedding 本身），`forward` 直接使用；加载器同时过滤 `lm_head.*`，不能因为缺少 `lm_head.weight` 报 missing。
+- 共享 RoPE：`get_rope` 返回的实例不要直接赋给每一层的普通属性；由模型层持有一次，或用非注册引用 / 显式把 cos/sin buffer 传给 AttentionLayer。
+- `q_norm` / `k_norm` 只由 `AttentionLayer` 注册一次，`RopeAttn` 不重复保存。
+
+#### 严格加载的兼容层
+
+- `strict=True` 负责 missing / unexpected key；shape 由 PyTorch 自动检查。
+- PyTorch 的 `load_state_dict` **不检查 dtype**（`copy_` 会静默转换），因此保留两层保护：加载器断言 checkpoint dtype == 目标 dtype；注册 `register_load_state_dict_pre_hook` 做同样的检查。禁止静默 cast。
+- tied embedding：加载器在 `tie_word_embeddings=True` 时过滤 `lm_head.*`；模型侧 `LMHead` 不注册独立权重。checkpoint 带 `lm_head.weight` 时不能报 missing。
+- 加载前显式比较 `set(model.state_dict())` 与映射后的 checkpoint key 集合，错误信息同时打印 missing / unexpected。
+- 若使用 `assign=True`，它要求 PyTorch ≥ 2.1；本仓库的 `torch>=2.4` 满足。旧环境退化为"目标 device 上预分配 + `load_state_dict(strict=True)`"，并在 pre-hook 中检查 dtype。
+
+#### 迁移验收命令
+
+```bash
+# 1. CPU 回归：前向、权重映射、生成语义必须原样通过
+pytest tests/test_model.py tests/test_naive_generate.py -q
+
+# 2. GPU 回归：与阶段 0 黄金基线逐 token / logits 对比
+pytest tests/test_naive_generation.py -m "gpu and slow"
+
+# 3. 手动对比（生成 + compare）
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B --model-source modelscope
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/naive/Qwen__Qwen3-0.6B/golden.json
+
+# 4. 严格加载与 key 集合检查（新增单测）
+pytest tests/test_model.py -q -k "state_dict or weight"
+```
+
+#### 对后续阶段的兼容性约定
+
+| 阶段 | 约定 |
+| --- | --- |
+| 7 高性能 attention | `AttentionLayer` 是 `nn.Module`，持有 `q_norm` / `k_norm`；后端接口仍只接收 q/k/v，不感知模块基类 |
+| 8 CUDA Graph | RoPE、静态 metadata 用 non-persistent buffer；capture 前必须 materialize 且地址稳定 |
+| 9 重叠调度 | engine 直接调用 `model.forward(...)`，不依赖 hooks；`nn.Module.__call__` 只作语法糖 |
+| 10 张量并行 | `Linear` 的 TP 变体继承 `nn.Module`；按 rank 分片用 `register_load_state_dict_pre_hook` 或 `load_weights()`，不恢复自定义递归 |
+| 11 MoE / kernel | `MoEMLP` / `MoELayer` 继承 `nn.Module`；kernel 封装与模块基类无关 |
+| 12 剖析验收 | 增加"模块框架开销（BaseOP vs nn.Module）"和"torch.compile on/off"两条 ablation |
+
 **要实现的模块**
 
 | 模块 | 职责 | 参考文件 |
 | --- | --- | --- |
+| `layers/*`、`models/*` | 迁移到 `nn.Module`（阶段 2 第 0 步），删除 `BaseOP` / `StateLessOP` / `OPList` | — |
 | `core.py` | `Req`、`Batch`、`Context`、全局 context | `python/minisgl/core.py` |
 | `kvcache/base.py` | `BaseKVCachePool`、`BaseCacheHandle` | `python/minisgl/kvcache/base.py` |
 | `kvcache/mha_pool.py` | MHA KV 池；`store_kv` 先用 torch fallback | `python/minisgl/kvcache/mha_pool.py` |
@@ -409,7 +476,7 @@ python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
 | `scheduler/batch.py` | 组装 `input_ids` / `positions` / `out_loc` | 参考 `Scheduler._prepare_batch` |
 | `scheduler/loop.py` | 最小调度：prefill 全部 pending，再 decode 全部 running | — |
 
-**建议拆成 5 个小步，每步都保持可运行：**
+**第 0 步完成后，建议再拆成 5 个小步，每步都保持可运行：**
 
 1. **单请求 + 连续 KV Cache。** 每个请求一块连续 KV 显存，decode 只写 1 个位置。验证输出与阶段 1 完全一致。
 2. **多请求 batch。** 把所有请求的 token 拼成一条扁平序列，用 `cu_seqlens` 区分边界；prefill 一次算多个请求。
@@ -443,6 +510,9 @@ python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
 - 人为构造共享页/跨界位置，不出现越界或串请求污染。
 - 请求结束后，页分配器能完整回收；`free_pages + used_pages == num_pages`。
 - 记录：不同 batch size、不同序列长度下的 decode 延迟与显存占用。
+- 迁移到 `nn.Module` 后，阶段 1 的 CPU 回归、GPU 黄金基线对比全部通过。
+- `model.state_dict()` 无重复 key；tied embedding 只出现一次；缺 key / 多 key / 形状 / dtype 错误均能报错。
+- 迁移前后同一配置的 forward 延迟差异 < 2%（记录一次 CPU 或 GPU 数字）。
 
 **常见坑**
 
@@ -453,6 +523,11 @@ python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
 - **页表越界**：为每个请求分配 `ceil(max_device_len / page_size)` 页，而不是只按当前长度分配。
 - **batch 内请求顺序**：后续 TP 要求所有 rank 的顺序一致，尽早按 `uid` 排序。
 - **padding / dummy 请求**：现在可以不做，但设计时给 CUDA Graph 留好 dummy page 的位置。
+- **`assign=True` 后 buffer 仍在 meta**：RoPE 等 non-persistent buffer 不会出现在 state_dict 里，必须显式 materialize 到目标 device。
+- **共享子模块导致重复 key**：`q_norm` / `k_norm` 不要同时挂在 `RopeAttn` 和 `AttentionLayer` 下；统一由 `AttentionLayer` 持有并映射 key。
+- **tied embedding 重复注册**：不要把同一个 `Parameter` 同时赋给 `embed_tokens.weight` 和 `lm_head.weight`；`LMHead` 不注册 weight，加载时过滤 `lm_head.*`。
+- **dtype 被静默转换**：PyTorch 的 `load_state_dict` 会用 `copy_` 隐式 cast，必须用 loader 断言或 pre-hook 补上检查。
+- **依赖 BaseOP 的旧代码**：迁移后统一显式调用 `forward(...)`，不要依赖属性遍历式 state_dict 或 `_internal` 参数。
 
 **阶段结束时的反思**
 
@@ -760,6 +835,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 | `attention/fi.py` | FlashInfer：prefill/decode wrapper、plan/run | `python/minisgl/attention/fi.py` |
 | `attention/trtllm.py` | 可选：TensorRT-LLM fmha | `python/minisgl/attention/trtllm.py` |
 | `attention/__init__.py` | 注册表与自动选择 | `python/minisgl/attention/__init__.py` |
+| `layers/attention.py` | `AttentionLayer(nn.Module)`：QK Norm、RoPE、调用后端；权重 key 由 loader 映射 | `python/minisgl/layers/attention.py` |
 | `engine/engine.py` | 自动选择后端、page size 覆盖 | `python/minisgl/engine/engine.py` |
 | `env.py` | `MINISGL_FLASHINFER_USE_TENSOR_CORES` | `python/minisgl/env.py` |
 
@@ -783,6 +859,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 - **Tensor Cores**：GQA 比例 ≥ 4 时默认启用；可用环境变量覆盖。
 - **混合后端**：Hopper 上默认 prefill 用 FA、decode 用 FI（`--attn fa,fi`）；通过 `HybridBackend` 按 batch 阶段分派。
 - **保留参考后端**：torch backend 永远保留，用于新特性/新页大小下的正确性对照。
+- **模块基类**：阶段 2 已统一为 `nn.Module`。`AttentionLayer` 持有 `q_norm` / `k_norm`，其 state_dict key 为 `self_attn.attn.q_norm.*` / `self_attn.attn.k_norm.*`，由 `weight.py` 在加载前从 HF key 映射过来；后端实现只依赖 q/k/v 与 metadata，不感知模块基类。
 
 **验收标准**
 
@@ -838,6 +915,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 - **replay 流程**：`copy_from(batch)` -> `prepare_for_replay(batch)` -> `g.replay()` -> 返回静态 `logits` 切片。
 - **只用于 decode**：`batch.is_decode and batch.size <= max_bs`。
 - **与 attention 后端的契约**：后端必须支持"静态 metadata + replay 前拷贝"；否则图会捕获到错误的指针。
+- **nn.Module buffer 与 meta device**：RoPE cos/sin、静态 metadata 都用 `register_buffer(..., persistent=False)`；若模型从 meta 构造，capture 前必须 materialize 到最终 device，并保证 buffer 的 `data_ptr()` 在 capture / replay 之间不变。
 - **开关**：`--cuda-graph-max-bs 0` 关闭，便于对照。
 
 **验收标准**
@@ -898,6 +976,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 - **双 stream 的采样与拷贝**：采样在 engine stream；结果拷回 CPU 用 event，主循环等待 event 后再处理。
 - **与 CUDA Graph 的交互**：capture / replay 必须在 engine stream；图捕获后不要在其他 stream 上并发使用同一组静态 buffer。
 - **与 TP 的交互**：所有 rank 的集合通信顺序必须一致；重叠不能改变 collective 的相对顺序。
+- **模块调用**：engine 直接调用 `model.forward(...)`；`nn.Module` 迁移后不依赖 hooks，避免重叠调度时出现隐式的 stream 同步或额外 Python 开销。
 
 **验收标准**
 
@@ -935,8 +1014,8 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 | --- | --- | --- |
 | `distributed/info.py` | `DistributedInfo`、`set_tp_info` / `get_tp_info` | `python/minisgl/distributed/info.py` |
 | `distributed/impl.py` | `all_reduce` / `all_gather`；torch 实现和 PyNCCL 插件 | `python/minisgl/distributed/impl.py` |
-| `layers/linear.py` | Column / Row Parallel、QKV 融合、O Proj、Replicated | `python/minisgl/layers/linear.py` |
-| `layers/embedding.py` | Vocab Parallel Embedding、LM Head all_gather | `python/minisgl/layers/embedding.py` |
+| `layers/linear.py` | Column / Row Parallel、QKV 融合、O Proj、Replicated（均为 `nn.Module`） | `python/minisgl/layers/linear.py` |
+| `layers/embedding.py` | Vocab Parallel Embedding、LM Head all_gather（`nn.Module`） | `python/minisgl/layers/embedding.py` |
 | `models/weight.py` | 权重按 TP 切分、融合、KV 头复制、专家堆叠 | `python/minisgl/models/weight.py` |
 | `engine/engine.py` | 进程组初始化（gloo / nccl）、PyNCCL | `python/minisgl/engine/engine.py` |
 | `scheduler/io.py` | rank 0 广播消息、CPU 侧计数同步 | `python/minisgl/scheduler/io.py` |
@@ -958,6 +1037,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
   - lm_head / embed_tokens 按 vocab 切；
   - KV 头不足时按 head 复制，而不是切分；
   - MoE 专家权重堆叠成 `[num_experts, ...]`。
+  - 阶段 2 已统一 `nn.Module`：TP 变体通过构造参数 + `register_load_state_dict_pre_hook`（或 `load_weights()`）按 rank 切分，不再依赖自定义 `BaseOP` 递归。切分必须发生在 pre-hook 内，确保 `assign=True` 安装的是切分后的张量，而不是先安装完整权重再切分。
 - **进程组**：
   - TP=1 或使用 PyNCCL 时，用 `gloo` 建 CPU 控制组；
   - 否则用 NCCL 建张量通信组；
@@ -1008,8 +1088,8 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 | `moe/fused.py` | fused MoE 实现 | `python/minisgl/moe/fused.py` |
 | `kernel/triton/fused_moe.py` | Triton：token 排列、分组 GEMM、加权求和 | `python/minisgl/kernel/triton/fused_moe.py` |
 | `kernel/moe_impl.py` | MoE kernel 封装 | `python/minisgl/kernel/moe_impl.py` |
-| `models/qwen3_moe.py` | MoE 模型定义 | `python/minisgl/models/qwen3_moe.py` |
-| `models/utils.py` | `MoEMLP`：router + experts | `python/minisgl/models/utils.py` |
+| `models/qwen3_moe.py` | MoE 模型定义（`nn.Module`） | `python/minisgl/models/qwen3_moe.py` |
+| `models/utils.py` | `MoEMLP(nn.Module)`：router + experts | `python/minisgl/models/utils.py` |
 | `kernel/{index,store,radix}.py` | 自定义 CUDA kernel：embedding / KV 写入 / 前缀比较 | `python/minisgl/kernel/` |
 | `kernel/pynccl.py` | 自定义 all-reduce | `python/minisgl/kernel/pynccl.py` |
 | `kernel/csrc/` | CUDA 源码与 tvm-ffi 绑定 | `python/minisgl/kernel/csrc/` |
@@ -1024,7 +1104,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
   4. 按专家分组、排列 token；
   5. 每个专家做 grouped GEMM；
   6. 反排列并按 gate 权重加权求和。
-- **专家权重**：堆叠成 `[num_experts, ...]`，加载时按专家切分/复制；TP 下专家也按 TP 切分。
+- **专家权重**：堆叠成 `[num_experts, ...]`，加载时按专家切分/复制；TP 下专家也按 TP 切分。MoE 模块沿用阶段 2 的 `nn.Module` 约定，kernel 封装与模块基类无关。
 - **Triton kernel**：块大小、每个专家的 token 数、排序顺序、累加精度；先写正确版本，再用 benchmark 调 block size。
 - **自定义 CUDA kernel 的选择标准**：只在瓶颈明确时写。`store_kv`、`indexing`、`fast_compare_key` 都是"访存型"算子，收益主要在减少 kernel launch 和 Python 开销；用 `tools/bench.py` 量化后再决定。
 - **tvm-ffi / JIT**：首次运行编译 CUDA，需要 nvcc；注意 arch 参数、include 路径、编译缓存。
@@ -1077,6 +1157,8 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
    | + CUDA Graph | | | | | | |
    | + 重叠调度 | | | | | | |
    | + TP=2 | | | | | | |
+
+   > 阶段 2 的 `nn.Module` 迁移是重构项，不进入上表的性能链路；单独记录一组"迁移前（BaseOP）/ 迁移后（nn.Module）"的 forward 延迟与显存，预期差异 < 2%。如果后续启用 `torch.compile`，再增加 compile on/off 对照。
 
 4. **Profiling**：
    - `nsys`：看 CPU/GPU 时间线、stream 重叠、kernel launch 间隔；
@@ -1134,6 +1216,8 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 - 有一份简短的实验记录（为什么这样做、结论是什么）；
 - `git tag` 可定位。
 
+> 例外：纯重构（如阶段 2 的 `nn.Module` 迁移）不要求运行时开关，"回到上一阶段"由上一阶段的 tag / 分支保证；但迁移前后的等价性测试必须齐全。
+
 ---
 
 ## 4. 常见误区与学习建议
@@ -1148,6 +1232,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 8. **不记录配置。** 同一个 benchmark 在不同 page size / batch / dtype 下没有可比性。
 9. **忽视数值容差。** bf16、FlashAttention、Tensor Core、all_reduce 都会带来微小差异；建立"容差内一致"的验收标准，而不是逐位相等。
 10. **跳过失败实验。** 记录"这个优化在什么场景下没有收益"同样有价值。
+11. **把 mini-sglang 的教学抽象当默认架构。** `BaseOP` 适合阶段 1 显式学习权重协议，但完整 SGLang 使用 `nn.Module`；阶段 2 起应迁移，避免后续 TP / MoE / 量化工具重复造轮子。
 
 ---
 
