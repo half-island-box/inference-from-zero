@@ -97,7 +97,7 @@ def test_rope_matches_hf() -> None:
         rotary_cfg.max_position,
         rotary_cfg.base,
         None,
-        str(torch.get_default_device()),
+        torch.device("cpu"),
     )
     positions = torch.tensor([0, 3, 7])
     q = torch.randn(1, 3, 4, rotary_cfg.head_dim)
@@ -112,6 +112,16 @@ def test_rope_matches_hf() -> None:
 
     torch.testing.assert_close(q_out, q_hf.transpose(1, 2), atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(k_out, k_hf.transpose(1, 2), atol=1e-6, rtol=1e-5)
+
+
+def test_rope_uses_explicit_device() -> None:
+    # 不能依赖 get_default_device()：部分 torch 版本不感知 torch.device 上下文
+    cpu_rope = get_rope(8, 8, 16, 10000.0, None, torch.device("cpu"))
+    meta_rope = get_rope(8, 8, 16, 10000.0, None, torch.device("meta"))
+
+    assert cpu_rope._cos.device.type == "cpu"
+    assert meta_rope._cos.device.type == "meta"
+    assert cpu_rope is not meta_rope
 
 
 def test_rmsnorm_matches_hf_formula() -> None:

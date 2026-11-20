@@ -53,7 +53,8 @@ class RopeAttn(BaseOP):
                 rotary_config.max_position,
                 rotary_config.base,
                 tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
-                str(torch.get_default_device()),
+                # get_default_device() 在部分 torch 版本不感知 torch.device 上下文
+                torch.empty(0).device,
             ),
             q_norm=self.q_norm,
             k_norm=self.k_norm,

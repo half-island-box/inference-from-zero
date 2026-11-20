@@ -27,10 +27,10 @@ class RotaryEmbedding(StateLessOP):
         rotary_dim: int,
         max_position: int,
         base: float,
+        device: torch.device,
     ) -> None:
         if rotary_dim != head_dim:
             raise ValueError(f"partial rotary is not supported: {rotary_dim=} {head_dim=}")
-        device = torch.get_default_device()
         inv_freq = 1.0 / (
             base
             ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
@@ -61,12 +61,11 @@ def get_rope(
     max_position: int,
     base: float,
     scaling: tuple[tuple[str, Any], ...] | None,
-    device_str: str,
+    device: torch.device,
 ) -> RotaryEmbedding:
-    """按配置缓存 RoPE 表，避免每层重复分配 cos/sin。"""
-    del device_str  # 仅用于区分默认设备不同的缓存条目
+    """按配置与设备缓存 RoPE 表，避免每层重复分配 cos/sin。"""
     if scaling is not None:
         rope_type = dict(scaling).get("rope_type", "default")
         if rope_type != "default":
             raise ValueError(f"stage 1 only supports default RoPE, got {rope_type!r}")
-    return RotaryEmbedding(head_dim, rotary_dim, max_position, base)
+    return RotaryEmbedding(head_dim, rotary_dim, max_position, base, device=device)
