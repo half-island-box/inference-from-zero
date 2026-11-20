@@ -55,7 +55,7 @@ my-sgl/
 ├── tools/
 │   ├── reference_hf.py      # 黄金基线：HF 生成 + logits
 │   ├── compare.py           # 对比你的输出与黄金输出
-│   ├── bench.py             # TTFT / ITL / throughput
+│   ├── bench.py             # TTFT / ITL / throughput，可追加实验日志
 │   └── workloads.py         # 固定测试负载
 ├── tests/
 │   ├── test_reference.py    # 端到端正确性
@@ -191,7 +191,7 @@ flowchart LR
   - 对固定 prompt 做 greedy 生成（`do_sample=False`），保存 input ids、output ids。
   - 对固定 input ids 做一次 forward，保存最后一个位置的 logits，便于逐层/逐阶段对比。
 - `tools/workloads.py`：定义 0.3 中的固定负载。
-- `tools/bench.py`：至少能测 TTFT、单步 decode 延迟、输出 token 吞吐。
+- `tools/bench.py`：至少能测 TTFT、单步 decode 延迟、输出 token 吞吐；支持 `--append-log --log-stage N` 把本轮数字按模板追加到 `experiments/log.md` 的阶段 N 小节。
 - `tests/test_reference.py`：调用 `tools/compare.py` 做端到端比对。
 - `experiments/log.md`：实验记录模板。
 
@@ -254,6 +254,9 @@ python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
 
 # 5. 基线性能数字（GPU）
 python tools/bench.py --model Qwen/Qwen3-0.6B --load all
+# 5b. 同上，并把本轮数字追加到 experiments/log.md 的「阶段 0」小节
+python tools/bench.py --model Qwen/Qwen3-0.6B --load all \
+    --append-log --log-stage 0 --log-note "阶段 0 黄金基线"
 ```
 
 > 基线尚未生成时，`tests/test_reference.py` 会 skip 而不是失败；先执行第 2 步。
@@ -1207,6 +1210,15 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
 | 5. 度量 | 跑固定负载，记录 TTFT/ITL/吞吐/显存 | 一组数字 |
 | 6. 对照 | 读参考实现，找出关键差异 | 改进点列表 |
 | 7. 收尾 | 更新 README、实验日志、打 tag | 可回退的里程碑 |
+
+第 5 步的度量直接沉淀进实验日志（`N` 替换为当前阶段号，支持 0–12）：
+
+```bash
+python tools/bench.py --model Qwen/Qwen3-0.6B --load all \
+    --append-log --log-stage N --log-note "阶段 N：<实验名 / 结论>"
+```
+
+> `bench.py` 目前只有 `hf` 后端，阶段 0 记录的是 HF 基线；阶段 3 接入 `engine` 后端后，后续阶段统一用它度量并追加日志。阶段 1–2 的度量仍按各自小节里的 `generate_naive.py --bench-lengths` 执行。
 
 **"完成"的定义**（每个阶段都适用）：
 
