@@ -23,7 +23,6 @@ import argparse
 import dataclasses
 import datetime
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,6 +34,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.hf_runtime import GreedyDecoder, HFRuntime, load_hf_runtime
+from tools.logbook import git_commit, gpu_env, insert_log_entry
 from tools.workloads import LOADS, Load, get_load, make_input_ids
 
 
@@ -189,34 +189,6 @@ def _print_summary(summary: dict[str, Any]) -> None:
     )
 
 
-def _run(cmd: list[str]) -> str | None:
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return proc.stdout.strip()
-
-
-def _git_commit() -> str:
-    sha = _run(["git", "rev-parse", "--short", "HEAD"])
-    if sha is None:
-        return "unknown"
-    return f"{sha} (dirty)" if _run(["git", "status", "--porcelain"]) else sha
-
-
-def _gpu_summary(runtime: HFRuntime) -> str:
-    """组装「GPU / 驱动 / torch / transformers」单行环境信息。"""
-    meta = runtime.meta
-    if runtime.device.startswith("cuda"):
-        name = meta.get("cuda_device") or runtime.device
-        driver_raw = _run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
-        driver = driver_raw.splitlines()[0].strip() if driver_raw else "?"
-        gpu = f"{name} / driver {driver}"
-    else:
-        gpu = f"device {runtime.device}（非 CUDA，仅 CPU 参考）"
-    return f"{gpu} / torch {meta['torch_version']} / transformers {meta['transformers_version']}"
-
-
 def _length_span(lengths: list[int] | tuple[int, ...]) -> str:
     values = list(lengths)
     lo, hi = min(values), max(values)
@@ -262,38 +234,6 @@ def format_log_entry(
         )
     lines += ["", f"- 结论 / 下一步: {note}", ""]
     return "\n".join(lines)
-
-
-def _is_stage_heading(line: str, stage: int) -> bool:
-    prefix = f"## 阶段 {stage}"
-    if not line.startswith(prefix):
-        return False
-    rest = line[len(prefix) :]
-    # 避免 "## 阶段 1" 误匹配 "## 阶段 10"
-    return not rest or not rest[0].isdigit()
-
-
-def insert_log_entry(path: Path, stage: int, entry: str) -> None:
-    """把记录插到 ``## 阶段 N`` 小节末尾；小节不存在时在文末新建。"""
-    text = path.read_text(encoding="utf-8") if path.exists() else "# 实验日志\n"
-    lines = text.splitlines(keepends=True)
-
-    start = next((i for i, line in enumerate(lines) if _is_stage_heading(line, stage)), None)
-    if start is None:
-        separator = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
-        path.write_text(
-            text + separator + f"## 阶段 {stage}\n\n{entry.rstrip()}\n", encoding="utf-8"
-        )
-        return
-
-    end = next((j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
-    # 去掉占位符，避免出现「（待开始）」压在记录上面
-    placeholders = {"（待开始）", "（待填）"}
-    body = [line for line in lines[start + 1 : end] if line.strip() not in placeholders]
-    section = "".join(body).strip("\n")
-    merged = (f"{section}\n\n" if section else "") + entry.rstrip() + "\n\n"
-    lines[start + 1 : end] = [f"\n{merged}"]
-    path.write_text("".join(lines), encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -348,8 +288,8 @@ def main(argv: list[str] | None = None) -> int:
                 "seed": args.seed,
                 "warmup": args.warmup,
             },
-            env=_gpu_summary(runtime),
-            commit=_git_commit(),
+            env=gpu_env(runtime.meta, runtime.device),
+            commit=git_commit(),
             note=args.log_note,
         )
         insert_log_entry(args.log_path, args.log_stage, entry)

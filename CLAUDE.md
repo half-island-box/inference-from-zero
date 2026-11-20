@@ -4,6 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 开发规范
 1. 每个阶段的代码完成后，将该阶段对应的架构图补充在reproduction-roadmap.zh-CN.md对应的位置里，并补充对应的测试命令
+2. 每阶段的测试命令，都要兼容--append-log can参数
 2. 不要写太多繁杂注释，注释统一用中文，只在关键作用的代码进行注释
 3. 用户没有明确声明，不要自作主张进行改动和开发
 4. 涉及到hugging face的地方，统一替换成等效的modelscope代码
@@ -59,6 +60,9 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all
 python tools/bench.py --list
 # 跑完自动把记录追加到 experiments/log.md 的「## 阶段 N」小节（N 可为 0–12 任一阶段）
 python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stage 2 --log-note "…"
+# 阶段 1 的 naive 生成 / 长度基准同样支持 --append-log
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
+    --bench-lengths 128,256,512,1024,2048 --append-log --log-stage 1
 
 black . && ruff check . --fix && mypy python/minisgl   # 与参考仓库一致的 lint 栈
 ```

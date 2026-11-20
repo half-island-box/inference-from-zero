@@ -96,12 +96,14 @@ python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
 # GPU：端到端验收
 pytest tests/test_naive_generation.py -m "gpu and slow"
 
-# 序列长度增长时单步 decode 的耗时
+# 序列长度增长时单步 decode 的耗时（并写入 log.md 阶段 1 表格）
 python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
-    --bench-lengths 128,256,512,1024,2048
+    --bench-lengths 128,256,512,1024,2048 --append-log --log-stage 1
 ```
 
 `scripts/generate_naive.py` 输出的 `golden.json` 与 `logits.npz` 和阶段 0 基线格式一致，可直接用 `tools/compare.py` 回归。
+
+`--append-log` 同样适用于生成模式（不传 `--bench-lengths`），此时记录 20 条 prompt 的 prefill/decode 均值和峰值显存；`--log-stage` 默认 1，`--log-note` 填写「结论 / 下一步」。
 
 ## 采样语义（后续所有阶段复用）
 

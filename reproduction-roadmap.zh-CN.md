@@ -359,11 +359,20 @@ flowchart TB
 **测试命令**
 
 ```bash
+# 0. 前置（仅首次）：环境与阶段 0 黄金基线
+uv venv --python=3.12 && source .venv/bin/activate
+uv pip install -e ".[dev]"
+python tools/reference_hf.py --model Qwen/Qwen3-0.6B
+python tools/reference_hf.py --model Qwen/Qwen3-0.6B --check-determinism
+
 # 1. CPU 单测：RoPE / RMSNorm / 前向对齐 HF / 权重融合与严格加载
 pytest tests/test_model.py -q
 
 # 2. CPU 单测：生成循环与 HF greedy 逐 token 一致、EOS 语义
 pytest tests/test_naive_generate.py -q
+
+# 2b. 全量 CPU 回归（不含 gpu 标记的用例）
+pytest -q -m "not gpu"
 
 # 3. GPU：生成阶段 1 输出并与阶段 0 黄金基线对比
 python scripts/generate_naive.py --model Qwen/Qwen3-0.6B --model-source modelscope
@@ -373,9 +382,13 @@ python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
 # 4. GPU：端到端验收测试（逐 token + logits 容差）
 pytest tests/test_naive_generation.py -m "gpu and slow"
 
-# 5. 序列长度对单步 decode 耗时的影响（阶段 2 的动机）
+# 5. 序列长度对单步 decode 耗时的影响（阶段 2 的动机），并写入 log.md 阶段 1
 python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
-    --bench-lengths 128,256,512,1024,2048
+    --bench-lengths 128,256,512,1024,2048 --append-log --log-stage 1
+
+# 6. 生成模式也可以追加记录（prefill/decode 均值 + 峰值显存）
+python scripts/generate_naive.py --model Qwen/Qwen3-0.6B --model-source modelscope \
+    --append-log --log-stage 1 --log-note "阶段 1 生成验收"
 ```
 
 **常见坑**
@@ -1218,7 +1231,7 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all \
     --append-log --log-stage N --log-note "阶段 N：<实验名 / 结论>"
 ```
 
-> `bench.py` 目前只有 `hf` 后端，阶段 0 记录的是 HF 基线；阶段 3 接入 `engine` 后端后，后续阶段统一用它度量并追加日志。阶段 1–2 的度量仍按各自小节里的 `generate_naive.py --bench-lengths` 执行。
+> `bench.py` 目前只有 `hf` 后端，阶段 0 记录的是 HF 基线；阶段 3 接入 `engine` 后端后，后续阶段统一用它度量并追加日志。阶段 1–2 的度量用 `scripts/generate_naive.py`，同样支持 `--append-log --log-stage N`。
 
 **"完成"的定义**（每个阶段都适用）：
 

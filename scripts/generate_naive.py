@@ -12,6 +12,11 @@
 
     python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
         --bench-lengths 128,256,512,1024,2048
+
+加 ``--append-log`` 可把本轮结果写入 ``experiments/log.md`` 的阶段小节::
+
+    python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
+        --bench-lengths 128,256,512,1024,2048 --append-log
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ for path in (str(ROOT), str(ROOT / "python")):
 
 import numpy as np
 import torch
+import transformers
 from minisgl.core import SamplingParams
 from minisgl.engine import naive_generate
 from minisgl.models import (
@@ -42,6 +48,7 @@ from minisgl.models import (
 )
 from transformers import AutoConfig, AutoTokenizer
 
+from tools.logbook import git_commit, gpu_env, insert_log_entry
 from tools.workloads import PROMPTS
 
 
@@ -80,6 +87,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated prompt lengths; measure one naive decode step for each",
     )
     parser.add_argument("--bench-repeats", type=int, default=3)
+    parser.add_argument(
+        "--append-log",
+        action="store_true",
+        help="把本轮结果追加到实验日志（默认 experiments/log.md）",
+    )
+    parser.add_argument("--log-path", type=Path, default=Path("experiments/log.md"))
+    parser.add_argument("--log-stage", type=int, default=1, help="记录所属阶段编号（默认 1）")
+    parser.add_argument("--log-note", default="待填", help="记录中的“结论 / 下一步”")
     args = parser.parse_args(argv)
     if args.max_tokens < 1:
         parser.error("--max-tokens must be >= 1")
@@ -118,14 +133,65 @@ def _meta(args: argparse.Namespace, model_path: str, hf_config: Any) -> dict:
         "dtype": args.dtype,
         "device": args.device,
         "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
         "cuda_device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None,
         "architectures": getattr(hf_config, "architectures", None),
     }
 
 
+def _fmt(value: float | None) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+def _log_header(args: argparse.Namespace, meta: dict, title: str) -> list[str]:
+    return [
+        f"### {datetime.date.today().isoformat()} — {title} （阶段 {args.log_stage}）",
+        "",
+        f"- commit: {git_commit()}",
+        f"- GPU / 驱动 / torch / transformers: {gpu_env(meta, args.device)}",
+        f"- 模型 / dtype: `{meta['model']}` / {meta['dtype']}（{meta['model_source']}）",
+    ]
+
+
+def format_generate_entry(stats: dict[str, Any], *, args: argparse.Namespace, meta: dict) -> str:
+    lines = _log_header(args, meta, "naive 生成（无 KV Cache）")
+    lines += [
+        f"- 配置: max_tokens={args.max_tokens}, ignore_eos={args.ignore_eos}, "
+        f"seed={args.seed}, {stats['num_prompts']} 条固定 prompt（raw token ids）",
+        f"- 结果: prefill 均值 = {_fmt(stats['prefill_mean_ms'])} ms；"
+        f"单步 decode 均值 = {_fmt(stats['decode_mean_ms'])} ms；"
+        f"峰值显存 = {_fmt(stats['peak_memory_gb'])} GB",
+        "",
+        f"- 结论 / 下一步: {args.log_note}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def format_bench_entry(
+    results: list[dict[str, Any]], *, args: argparse.Namespace, meta: dict
+) -> str:
+    lengths = ", ".join(str(item["prompt_len"]) for item in results)
+    lines = _log_header(args, meta, "naive decode 长度扩展")
+    lines += [
+        f"- 配置: 无 KV Cache，每步重算全序列；bench_repeats={args.bench_repeats}",
+        f"- 负载: prompt 长度 {lengths}",
+        "",
+        "| prompt 长度 | prefill 耗时 (ms) | 单步 decode（长度 L+1）(ms) |",
+        "| --- | --- | --- |",
+    ]
+    for item in results:
+        lines.append(
+            f"| {item['prompt_len']} | {_fmt(item['prefill_ms'])} "
+            f"| {_fmt(item['decode_mean_ms'])} |"
+        )
+    lines += ["", f"- 结论 / 下一步: {args.log_note}", ""]
+    return "\n".join(lines)
+
+
 def run_generation(
-    args: argparse.Namespace, model: BaseLLMModel, model_path: str, hf_config: Any
-) -> None:
+    args: argparse.Namespace, model: BaseLLMModel, model_path: str, meta: dict
+) -> dict[str, Any]:
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     eos_token_id = tokenizer.eos_token_id
     prompts = PROMPTS[: args.limit] if args.limit else PROMPTS
@@ -169,7 +235,7 @@ def run_generation(
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "kind": "naive",
-        "meta": _meta(args, model_path, hf_config),
+        "meta": meta,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "sampling": {
             "max_tokens": args.max_tokens,
@@ -185,19 +251,33 @@ def run_generation(
     golden_json = out_dir / "golden.json"
     golden_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     np.savez_compressed(out_dir / "logits.npz", **logits_by_id)
+
+    peak_gb = None
     if args.device.startswith("cuda"):
-        print(f"peak memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        print(f"peak memory: {peak_gb:.2f} GB")
     print(f"wrote {golden_json} and {out_dir / 'logits.npz'}")
+
+    decode_means: list[float] = []
+    for case in cases:
+        mean = _mean(case["timing"]["decode_ms"])
+        if mean is not None:
+            decode_means.append(mean)
+    return {
+        "num_prompts": len(cases),
+        "prefill_mean_ms": _mean([case["timing"]["prefill_ms"] for case in cases]),
+        "decode_mean_ms": _mean(decode_means),
+        "peak_memory_gb": peak_gb,
+    }
 
 
 def run_bench(
     args: argparse.Namespace,
     model: BaseLLMModel,
     out_dir: Path,
-    model_path: str,
-    hf_config: Any,
+    meta: dict,
     vocab_size: int,
-) -> None:
+) -> list[dict[str, Any]]:
     device = torch.device(args.device)
     lengths = [int(item) for item in args.bench_lengths.split(",") if item.strip()]
     if not lengths:
@@ -238,13 +318,14 @@ def run_bench(
     path = out_dir / "bench_decode.json"
     path.write_text(
         json.dumps(
-            {"meta": _meta(args, model_path, hf_config), "results": results},
+            {"meta": meta, "results": results},
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
     print(f"wrote {path}")
+    return results
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -252,11 +333,18 @@ def main(argv: list[str] | None = None) -> int:
     torch.manual_seed(args.seed)
     model, config, model_path, hf_config = load_model(args)
     out_dir = args.output or Path("out") / "naive" / model_slug(args.model)
+    meta = _meta(args, model_path, hf_config)
 
     if args.bench_lengths:
-        run_bench(args, model, out_dir, model_path, hf_config, config.vocab_size)
+        results = run_bench(args, model, out_dir, meta, config.vocab_size)
+        entry = format_bench_entry(results, args=args, meta=meta)
     else:
-        run_generation(args, model, model_path, hf_config)
+        stats = run_generation(args, model, model_path, meta)
+        entry = format_generate_entry(stats, args=args, meta=meta)
+
+    if args.append_log:
+        insert_log_entry(args.log_path, args.log_stage, entry)
+        print(f"\nappended log entry -> {args.log_path}")
     return 0
 
 
