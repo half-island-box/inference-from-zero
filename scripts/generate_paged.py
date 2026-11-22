@@ -14,6 +14,9 @@
         --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2
     python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
         --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2
+
+每个配置计时前默认跑 1 次同形状预热（``--warmup``），避免首个 batch 的
+CUDA kernel 加载 / allocator 初始化开销污染 prefill 数据。
 """
 
 from __future__ import annotations
@@ -87,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--bench-token-len", type=int, default=256, help="prompt length for batch bench"
     )
     parser.add_argument(
+        "--warmup",
+        type=int,
+        default=1,
+        help="每个配置计时前的不计时预热次数（默认 1）",
+    )
+    parser.add_argument(
         "--append-log",
         action="store_true",
         help="把本轮结果追加到实验日志（默认 experiments/log.md）",
@@ -103,6 +112,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--limit must be >= 0")
     if args.bench_batch < 1:
         parser.error("--bench-batch must be >= 1")
+    if args.warmup < 0:
+        parser.error("--warmup must be >= 0")
     return args
 
 
@@ -192,6 +203,17 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _run_warmup(
+    engine: PagedEngine,
+    requests: list[BatchRequest],
+    rounds: int,
+    eos_token_id: int | None = None,
+) -> None:
+    """用同形状请求预热 kernel / allocator，结果不计入统计。"""
+    for _ in range(rounds):
+        engine.generate(requests, eos_token_id=eos_token_id)
+
+
 def _log_header(args: argparse.Namespace, meta: dict[str, Any], title: str) -> list[str]:
     return [
         f"### {datetime.date.today().isoformat()} — {title} （阶段 {args.log_stage}）",
@@ -200,6 +222,7 @@ def _log_header(args: argparse.Namespace, meta: dict[str, Any], title: str) -> l
         f"- GPU / 驱动 / torch / transformers: {gpu_env(meta, args.device)}",
         f"- 模型 / dtype: `{meta['model']}` / {meta['dtype']}（{meta['model_source']}）",
         f"- KV cache: page_size={args.page_size}, max_running_req={args.max_running_req}",
+        f"- warmup: {args.warmup} 次/配置（不计时）",
     ]
 
 
@@ -269,8 +292,6 @@ def run_generation(
 
     out_dir = args.output or Path("out") / "paged" / model_slug(args.model)
     out_dir.mkdir(parents=True, exist_ok=True)
-    if args.device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
 
     cases: list[dict[str, Any]] = []
     logits_by_id: dict[str, np.ndarray] = {}
@@ -286,6 +307,14 @@ def run_generation(
             )
             for _, ids in chunk
         ]
+        if start == 0:
+            # 首个 batch 先打满同形状的预热请求，再重置显存统计
+            warm_requests = [
+                BatchRequest(ids, SamplingParams(max_tokens=1, ignore_eos=True)) for _, ids in chunk
+            ]
+            _run_warmup(engine, warm_requests, args.warmup, eos_token_id)
+            if args.device.startswith("cuda"):
+                torch.cuda.reset_peak_memory_stats()
         run = engine.generate(requests, eos_token_id=eos_token_id)
         prefill_ms.append(run.prefill_ms)
         if run.decode_ms:
@@ -347,9 +376,21 @@ def run_generation(
 
 
 def _bench_one(
-    engine: PagedEngine, vocab_size: int, batch_size: int, seq_len: int, max_tokens: int
+    engine: PagedEngine,
+    vocab_size: int,
+    batch_size: int,
+    seq_len: int,
+    max_tokens: int,
+    warmup: int,
 ) -> dict[str, Any]:
     token_id = min(1000, vocab_size - 1)
+    if warmup > 0:
+        warm_requests = [
+            BatchRequest([token_id] * seq_len, SamplingParams(max_tokens=1, ignore_eos=True))
+            for _ in range(batch_size)
+        ]
+        _run_warmup(engine, warm_requests, warmup)
+
     requests = [
         BatchRequest([token_id] * seq_len, SamplingParams(max_tokens=max_tokens, ignore_eos=True))
         for _ in range(batch_size)
@@ -395,7 +436,9 @@ def run_bench(
     engine = _make_engine(args, model, config, num_pages, max_seq_len)
     rows = []
     for key, batch_size, seq_len in zip(keys, batch_sizes, seq_lens):
-        stats = _bench_one(engine, config.vocab_size, batch_size, seq_len, args.max_tokens)
+        stats = _bench_one(
+            engine, config.vocab_size, batch_size, seq_len, args.max_tokens, args.warmup
+        )
         row = {"key": key, **stats}
         rows.append(row)
         print(

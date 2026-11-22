@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
-from scripts.generate_paged import format_bench_entry, format_generate_entry  # noqa: E402
+from scripts.generate_paged import (  # noqa: E402
+    _bench_one,
+    format_bench_entry,
+    format_generate_entry,
+    parse_args,
+)
 
 META: dict[str, Any] = {
     "model": "Qwen/Qwen3-0.6B",
@@ -33,6 +39,7 @@ def _args(**overrides: Any) -> argparse.Namespace:
         "seed": 0,
         "bench_token_len": 256,
         "bench_batch": 1,
+        "warmup": 1,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -51,6 +58,7 @@ def test_format_generate_entry_for_stage2() -> None:
     assert "paged KV Cache 批量生成 （阶段 2）" in entry
     assert "`Qwen/Qwen3-0.6B` / bfloat16（modelscope）" in entry
     assert "KV cache: page_size=16, max_running_req=8" in entry
+    assert "warmup: 1 次/配置（不计时）" in entry
     assert "max_tokens=32, ignore_eos=True, batch≤8" in entry
     assert "prefill 均值 = 8.50 ms" in entry
     assert "单步 decode 均值 = 4.25 ms" in entry
@@ -79,3 +87,34 @@ def test_missing_values_render_as_dash() -> None:
     rows = [{"key": 1, "prefill_ms": None, "decode_mean_ms": None, "peak_memory_gb": None}]
     entry = format_bench_entry(rows, args=_args(), meta=META, kind="batch")
     assert "| 1 | - | - | - |" in entry
+
+
+class _FakeEngine:
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.calls = 0
+
+    def generate(self, requests, eos_token_id=None):  # noqa: ANN001
+        self.calls += 1
+        return SimpleNamespace(prefill_ms=1.0, decode_ms=[1.0])
+
+    def check_integrity(self) -> None:
+        pass
+
+
+def test_bench_one_runs_warmup_before_measurement() -> None:
+    engine = _FakeEngine()
+    stats = _bench_one(
+        engine,  # type: ignore[arg-type]
+        vocab_size=64,
+        batch_size=2,
+        seq_len=8,
+        max_tokens=4,
+        warmup=3,
+    )
+    assert engine.calls == 4
+    assert stats["prefill_ms"] == 1.0
+
+
+def test_warmup_defaults_to_one() -> None:
+    assert parse_args([]).warmup == 1

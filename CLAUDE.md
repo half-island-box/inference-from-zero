@@ -82,11 +82,12 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stag
 python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
     --bench-lengths 128,256,512,1024,2048 --append-log --log-stage 1
 # 阶段 2 paged 批量生成 / batch·序列长度基准，同样支持 --append-log
-python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 16
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 16 --warmup 1
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
-    --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2
+    --bench-batch-sizes 1,2,4,8 --warmup 1 --append-log --log-stage 2
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
-    --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2
+    --bench-seq-lens 128,256,512,1024 --warmup 1 --append-log --log-stage 2
+# --warmup N 默认 1：每个配置计时前用同形状请求预热，避免首 batch 启动开销污染 prefill
 
 black . && ruff check . --fix && mypy python/minisgl   # 与参考仓库一致的 lint 栈
 ```

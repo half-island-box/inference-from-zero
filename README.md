@@ -123,19 +123,22 @@ pytest tests/test_module_migration.py tests/test_kvcache_alloc.py \
        tests/test_paged_engine.py tests/test_torch_attn.py -q
 
 # GPU：paged 批量生成 + 黄金基线对比
-python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --model-source modelscope --page-size 16
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --model-source modelscope \
+    --page-size 16 --warmup 1
 python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
                         --actual   out/paged/Qwen__Qwen3-0.6B/golden.json
 pytest tests/test_paged_generation.py -m "gpu and slow"
 
 # 不同 batch size / 序列长度的 decode 延迟与显存，写入 log.md 阶段 2
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
-    --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2
+    --bench-batch-sizes 1,2,4,8 --warmup 1 --append-log --log-stage 2
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
-    --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2
+    --bench-seq-lens 128,256,512,1024 --warmup 1 --append-log --log-stage 2
 ```
 
 `--page-size` 切换 1/4/16 时输出必须逐 token 一致；`--num-pages 0`（默认）会按负载与空闲显存自动估算页数。
+
+`--warmup N`（默认 1）会在每个配置计时前用同形状请求预热 N 次，避免首个 batch 的 CUDA kernel 懒加载 / allocator 初始化开销（约 90–120 ms）进入 prefill 数字；`--warmup 0` 可复现未预热结果。
 
 ## 采样语义（后续所有阶段复用）
 

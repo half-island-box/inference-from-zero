@@ -603,29 +603,32 @@ pytest tests/test_paged_engine.py -q
 pytest -q -m "not gpu"
 
 # 4. GPU：paged 批量生成，与阶段 0 黄金基线逐 token / logits 对比
-python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --model-source modelscope --page-size 16
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --model-source modelscope \
+    --page-size 16 --warmup 1
 python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
                         --actual   out/paged/Qwen__Qwen3-0.6B/golden.json
 pytest tests/test_paged_generation.py -m "gpu and slow"
 
 # 5. GPU：page_size=1 / 16 输出一致（换 page_size 再跑一次后对比）
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 1 \
-    --output out/paged_page1/Qwen__Qwen3-0.6B
+    --output out/paged_page1/Qwen__Qwen3-0.6B --warmup 1
 python tools/compare.py --baseline out/paged/Qwen__Qwen3-0.6B/golden.json \
                         --actual   out/paged_page1/Qwen__Qwen3-0.6B/golden.json
 
 # 6. GPU：不同 batch size、序列长度下的延迟与显存，并写入 log.md 阶段 2
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
-    --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2 \
+    --bench-batch-sizes 1,2,4,8 --warmup 1 --append-log --log-stage 2 \
     --log-note "阶段 2 batch 扩展"
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
-    --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2 \
+    --bench-seq-lens 128,256,512,1024 --warmup 1 --append-log --log-stage 2 \
     --log-note "阶段 2 序列长度扩展"
 
 # 7. 生成模式同样支持 --append-log（prefill/decode 均值 + 峰值显存）
 python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 16 \
-    --append-log --log-stage 2 --log-note "阶段 2 批量生成验收"
+    --warmup 1 --append-log --log-stage 2 --log-note "阶段 2 批量生成验收"
 ```
+
+> `--warmup N`（默认 1）会在每个配置计时前用**同形状**请求预热 N 次，覆盖 CUDA kernel 懒加载、cuBLAS / SDPA 首次选择与 allocator 初始化，避免首个 batch 约 90–120 ms 的启动开销进入 prefill 数据。设为 `--warmup 0` 可复现未预热的原始数字。
 
 **常见坑**
 
