@@ -10,8 +10,22 @@ import functools
 from typing import Any
 
 import torch
+from torch import nn
 
-from .base import StateLessOP
+# meta 构建模型时，RoPE buffer 必须显式放到目标设备，不能留在 meta
+_ROPE_DEVICE: torch.device | None = None
+
+
+def set_rope_device(device: str | torch.device | None) -> torch.device | None:
+    """设置 RoPE buffer 的构造设备，返回旧值方便恢复。"""
+    global _ROPE_DEVICE
+    old = _ROPE_DEVICE
+    _ROPE_DEVICE = None if device is None else torch.device(device)
+    return old
+
+
+def resolve_rope_device(default: torch.device) -> torch.device:
+    return _ROPE_DEVICE if _ROPE_DEVICE is not None else default
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -20,7 +34,10 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
-class RotaryEmbedding(StateLessOP):
+class RotaryEmbedding(nn.Module):
+    _cos: torch.Tensor
+    _sin: torch.Tensor
+
     def __init__(
         self,
         head_dim: int,
@@ -29,6 +46,7 @@ class RotaryEmbedding(StateLessOP):
         base: float,
         device: torch.device,
     ) -> None:
+        super().__init__()
         if rotary_dim != head_dim:
             raise ValueError(f"partial rotary is not supported: {rotary_dim=} {head_dim=}")
         inv_freq = 1.0 / (
@@ -37,12 +55,11 @@ class RotaryEmbedding(StateLessOP):
         )
         positions = torch.arange(max_position, dtype=torch.float32, device=device)
         freqs = torch.outer(positions, inv_freq)
-        # 每个频率覆盖前后两半，拼成完整 head_dim
         cos = freqs.cos()
         sin = freqs.sin()
-        # 注册成普通属性会进入 state_dict，因此用下划线前缀的 buffer
-        self._cos = torch.cat((cos, cos), dim=-1)
-        self._sin = torch.cat((sin, sin), dim=-1)
+        # non-persistent buffer：不进入 state_dict，但会跟随 .to() / assign 之外的生命周期
+        self.register_buffer("_cos", torch.cat((cos, cos), dim=-1), persistent=False)
+        self.register_buffer("_sin", torch.cat((sin, sin), dim=-1), persistent=False)
 
     def forward(
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
@@ -67,5 +84,5 @@ def get_rope(
     if scaling is not None:
         rope_type = dict(scaling).get("rope_type", "default")
         if rope_type != "default":
-            raise ValueError(f"stage 1 only supports default RoPE, got {rope_type!r}")
+            raise ValueError(f"stage 2 only supports default RoPE, got {rope_type!r}")
     return RotaryEmbedding(head_dim, rotary_dim, max_position, base, device=device)

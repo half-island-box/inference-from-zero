@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 
 from minisgl.layers import (
     AttentionLayer,
-    BaseOP,
     Linear,
-    RMSNorm,
     gelu_and_mul,
     get_rope,
+    resolve_rope_device,
     silu_and_mul,
 )
 
@@ -19,8 +19,9 @@ from .config import ModelConfig
 _ACT_FNS = {"silu": silu_and_mul, "gelu": gelu_and_mul}
 
 
-class GatedMLP(BaseOP):
+class GatedMLP(nn.Module):
     def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
         self.gate_up_proj = Linear(config.hidden_size, 2 * config.intermediate_size, has_bias=False)
         try:
             self.act_fn = _ACT_FNS[config.hidden_act]
@@ -29,19 +30,18 @@ class GatedMLP(BaseOP):
         self.down_proj = Linear(config.intermediate_size, config.hidden_size, has_bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        return self.down_proj.forward(self.act_fn(self.gate_up_proj.forward(x)))
 
 
-class RopeAttn(BaseOP):
+class RopeAttn(nn.Module):
     def __init__(self, config: ModelConfig, layer_id: int, *, has_qk_norm: bool = False) -> None:
+        super().__init__()
         rotary_config = config.rotary_config
         self.qkv_proj = Linear(
             config.hidden_size,
             (config.num_qo_heads + 2 * config.num_kv_heads) * config.head_dim,
             has_bias=config.attention_bias,
         )
-        self.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps) if has_qk_norm else None
-        self.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps) if has_qk_norm else None
         self.attn = AttentionLayer(
             layer_id=layer_id,
             num_qo_heads=config.num_qo_heads,
@@ -53,15 +53,13 @@ class RopeAttn(BaseOP):
                 rotary_config.max_position,
                 rotary_config.base,
                 tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
-                # get_default_device() 在部分 torch 版本不感知 torch.device 上下文
-                torch.empty(0).device,
+                resolve_rope_device(torch.empty(0).device),
             ),
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
+            qk_norm_eps=config.rms_norm_eps if has_qk_norm else None,
         )
         self.o_proj = Linear(
             config.num_qo_heads * config.head_dim, config.hidden_size, has_bias=False
         )
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        return self.o_proj(self.attn(self.qkv_proj(x), positions))
+        return self.o_proj.forward(self.attn.forward(self.qkv_proj.forward(x), positions))

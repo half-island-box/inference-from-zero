@@ -530,6 +530,103 @@ pytest tests/test_model.py -q -k "state_dict or weight"
 - `model.state_dict()` 无重复 key；tied embedding 只出现一次；缺 key / 多 key / 形状 / dtype 错误均能报错。
 - 迁移前后同一配置的 forward 延迟差异 < 2%（记录一次 CPU 或 GPU 数字）。
 
+**阶段架构图**
+
+```mermaid
+flowchart TB
+    subgraph BUILD["模型构建（第 0 步：nn.Module）"]
+        CFG["ModelConfig"] --> META["create_model<br/>meta device + 目标 dtype<br/>RoPE buffer 直接建在真实设备"]
+        CKPT["safetensors<br/>流式 load_weight"] --> MAP["weight.py<br/>qkv / gate_up 融合<br/>q_norm → attn.q_norm"]
+        MAP --> ASSIGN["load_state_dict(strict=True, assign=True)<br/>key / shape / dtype 检查"]
+        META --> ASSIGN
+    end
+
+    subgraph ENGINE["PagedEngine（scheduler/loop.py）"]
+        REQ["BatchRequest → Req<br/>cached_len / device_len / max_device_len"] --> PREFILL["prefill batch<br/>全部 pending 一次算完"]
+        PREFILL --> DECODE["decode batch<br/>running 按 uid 排序"]
+        DECODE -->|"未完成"| DECODE
+    end
+    ASSIGN --> ENGINE
+
+    subgraph PREP["每个 batch 的准备（scheduler/batch.py + cache.py）"]
+        ALLOC["CacheManager.allocate_paged<br/>按 ceil(cached_len/page_size)<br/>→ ceil(device_len/page_size) 分配页"]
+        PT["页表写入<br/>逻辑位置 → 原始 token 槽位"]
+        INPUT["positions = cached_len..device_len-1<br/>input_ids = token_pool[table_idx]<br/>out_loc = page_table[table_idx, cached_len:device_len]"]
+        META2["attn_backend.prepare_metadata<br/>q/kv 长度、cached_len、页表行"]
+        ALLOC --> PT --> INPUT --> META2
+    end
+    PREFILL --> PREP
+    DECODE --> PREP
+
+    subgraph ATTN["Attention 与 KV（attention/torch_backend.py + kvcache/mha_pool.py）"]
+        QKV["qkv_proj → QK Norm → RoPE"] --> STORE["先 store_kv(k, v, out_loc)"]
+        STORE --> GATHER["按页表 gather [0, device_len) 的 K/V"]
+        GATHER --> SDPA["参考后端：逐请求 SDPA<br/>prefill causal / decode 全历史<br/>extend 用 diagonal=cached_len 的 mask"]
+        SDPA --> OPROJ["o_proj"]
+    end
+    META2 --> ATTN
+
+    subgraph POOL["KV 池布局"]
+        LAYOUT["(2, num_layers, num_pages + 1,<br/>page_size, kv_heads, head_dim)<br/>+1 dummy page"]
+    end
+    POOL --> STORE
+    POOL --> GATHER
+
+    subgraph POST["结果处理"]
+        LOGITS["按 get_last_indices 取每个请求的 logits"] --> SAMPLE["greedy_sample"]
+        SAMPLE -->|"未结束：写回 token_pool + complete_one"| DECODE
+        SAMPLE -->|"EOS / 达到 max_tokens"| FREE["TableManager.free + cache_req(finished=True)<br/>页表回收"]
+        FREE --> CHECK["check_integrity<br/>free_pages == num_pages"]
+    end
+    ATTN --> LOGITS
+
+    CHECK --> OUT["JSON + logits.npz<br/>→ tools/compare.py"]
+```
+
+> 阶段 2 的 attention 参考后端按请求循环 gather K/V，便于和 SDPA 对齐；高性能 varlen / paged kernel 留到阶段 7。页表始终按 page_size=1 记录原始 token 槽位，page_size>1 时由分配器展开成连续页内槽位。
+
+**测试命令**
+
+```bash
+# 0. CPU：第 0 步迁移回归（阶段 1 测试原样通过）
+pytest tests/test_model.py tests/test_naive_generate.py -q
+# 严格加载、key 唯一性、tied embedding、meta + assign
+pytest tests/test_module_migration.py -q
+
+# 1. CPU：页分配、page_size 1/4/16、跨页与完整性
+pytest tests/test_kvcache_alloc.py tests/test_torch_attn.py -q
+
+# 2. CPU：单请求 / 多请求 batch 与阶段 1 逐 token 一致
+pytest tests/test_paged_engine.py -q
+
+# 3. 全量 CPU 回归
+pytest -q -m "not gpu"
+
+# 4. GPU：paged 批量生成，与阶段 0 黄金基线逐 token / logits 对比
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --model-source modelscope --page-size 16
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/paged/Qwen__Qwen3-0.6B/golden.json
+pytest tests/test_paged_generation.py -m "gpu and slow"
+
+# 5. GPU：page_size=1 / 16 输出一致（换 page_size 再跑一次后对比）
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 1 \
+    --output out/paged_page1/Qwen__Qwen3-0.6B
+python tools/compare.py --baseline out/paged/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/paged_page1/Qwen__Qwen3-0.6B/golden.json
+
+# 6. GPU：不同 batch size、序列长度下的延迟与显存，并写入 log.md 阶段 2
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
+    --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2 \
+    --log-note "阶段 2 batch 扩展"
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
+    --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2 \
+    --log-note "阶段 2 序列长度扩展"
+
+# 7. 生成模式同样支持 --append-log（prefill/decode 均值 + 峰值显存）
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 16 \
+    --append-log --log-stage 2 --log-note "阶段 2 批量生成验收"
+```
+
 **常见坑**
 
 - **索引 dtype**：页表、`out_loc`、`positions` 用 int32 还是 int64 不一致，会导致 kernel 或 gather 报错。

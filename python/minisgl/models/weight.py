@@ -40,6 +40,13 @@ def resolve_model_path(model: str, model_source: str = "modelscope") -> str:
     raise ValueError(f"unknown model source: {model_source!r}")
 
 
+def _rewrite_key(key: str) -> str:
+    # QK Norm 从 RopeAttn 移到 AttentionLayer 内部，state_dict key 多一层 attn
+    return key.replace(".self_attn.q_norm.", ".self_attn.attn.q_norm.").replace(
+        ".self_attn.k_norm.", ".self_attn.attn.k_norm."
+    )
+
+
 def _merge_target(key: str) -> tuple[str, str, tuple[str, ...]] | None:
     for suffix, (merged_suffix, slot, slots) in _MERGE_GROUPS.items():
         if suffix in key:
@@ -62,6 +69,7 @@ def convert_hf_state_dict(
             continue
         if tie_word_embeddings and key.startswith("lm_head."):
             continue
+        key = _rewrite_key(key)
         target = _merge_target(key)
         if target is None:
             result[key] = tensor
@@ -95,16 +103,17 @@ def load_weight(
     buffers: dict[str, dict[str, torch.Tensor]] = {}
     for file in files:
         with safetensors.safe_open(file, framework="pt", device="cpu") as handle:
-            for key in handle.keys():
-                if _skip(key) or (tie_word_embeddings and key.startswith("lm_head.")):
+            for raw_key in handle.keys():
+                if _skip(raw_key) or (tie_word_embeddings and raw_key.startswith("lm_head.")):
                     continue
+                key = _rewrite_key(raw_key)
                 target = _merge_target(key)
                 if target is None:
-                    yield key, handle.get_tensor(key).to(device=device, dtype=dtype)
+                    yield key, handle.get_tensor(raw_key).to(device=device, dtype=dtype)
                     continue
 
                 merged_key, slot, slots = target
-                buffers.setdefault(merged_key, {})[slot] = handle.get_tensor(key)
+                buffers.setdefault(merged_key, {})[slot] = handle.get_tensor(raw_key)
                 if len(buffers[merged_key]) == len(slots):
                     merged = torch.cat([buffers[merged_key][s] for s in slots], dim=0)
                     del buffers[merged_key]

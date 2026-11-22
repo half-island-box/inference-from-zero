@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import torch
+from torch import nn
 
-from .base import BaseOP
 
-
-class RMSNorm(BaseOP):
+class RMSNorm(nn.Module):
     def __init__(self, size: int, eps: float) -> None:
-        self.weight = torch.empty(size)
+        super().__init__()
+        # 推理不需要梯度，权重固定
+        self.weight = nn.Parameter(torch.empty(size), requires_grad=False)
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

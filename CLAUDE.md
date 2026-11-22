@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本仓库是**从零复现 mini-sglang 推理引擎**的工程，按 [reproduction-roadmap.zh-CN.md](reproduction-roadmap.zh-CN.md) 分 13 个阶段（阶段 0–12）推进。路线图是唯一的规格来源：每个阶段的目标、要实现的模块、验收标准、常见坑都在里面，动手前先读对应阶段。
 
 - **参考实现（只读）**：`/Users/bj/Coding/github/mini-sglang`（upstream `sgl-project/mini-sglang`，当前 `9a91cfa`）。其中 `docs/features.zh-CN.md`、`docs/structures.zh-CN.md`、`docs/reproduction-roadmap.zh-CN.md` 是本地未提交的中文文档。
-- **当前状态**：阶段 0 脚手架已完成（`tools/`、`tests/`、`experiments/log.md`）；黄金基线需在 GPU 主机上运行 `tools/reference_hf.py` 生成；阶段 1 尚未开始。
+- **当前状态**：阶段 0 脚手架完成；阶段 1 最小生成器代码与 CPU 测试完成；阶段 2（`nn.Module` 迁移、KV Cache、批量前向、Paged Attention）代码与 CPU 测试完成。阶段 1/2 的 GPU 验收仍需在 GPU 主机上运行黄金基线对比。
 - 代码应写在**本仓库**；参考仓库只用于卡住后对照接口和关键函数，不要整段搬运。先自己写，再 diff。
 
 ## 运行环境
@@ -29,6 +29,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```
 python/minisgl/          # 自己的实现，模块划分与参考实现一致
+  core.py                # SamplingParams、Req / Batch / Context
+  layers/                # nn.Module：RMSNorm、Linear、RoPE、Attention、Embedding
+  models/                # 配置、Llama/Qwen3、safetensors 权重加载
+  kvcache/               # KV 池、前缀缓存接口、naive 前缀缓存
+  attention/             # attention backend 接口与 torch 参考实现
+  scheduler/             # 请求槽位、页分配器、batch 组装、静态调度循环
+  engine/                # greedy 采样与 naive 生成循环
+scripts/generate_naive.py # 阶段 1：生成 / 对比 / 长度基准
+scripts/generate_paged.py # 阶段 2：paged 批量生成 / 对比 / batch·长度基准
 tools/reference_hf.py    # 黄金基线：HF greedy 生成 + logits
 tools/compare.py         # 与黄金输出对比（token 精确 / logits 容差）
 tools/bench.py           # TTFT / ITL / 吞吐 / 峰值显存
@@ -38,6 +47,15 @@ tests/test_reference.py  # 端到端正确性（gpu + slow）
 tests/test_hf_runtime.py # 小模型 CPU 解码语义测试
 tests/test_compare.py    # 对比工具单测
 tests/test_workloads.py  # 负载定义单测
+tests/test_model.py      # 前向对齐 HF、权重映射（CPU）
+tests/test_naive_generate.py # 阶段 1 生成语义（CPU）
+tests/test_naive_generation.py # 阶段 1 GPU 验收
+tests/test_module_migration.py # 阶段 2 nn.Module 迁移与严格加载（CPU）
+tests/test_kvcache_alloc.py    # 阶段 2 页分配（CPU）
+tests/test_torch_attn.py       # 阶段 2 extend prefill 语义（CPU）
+tests/test_paged_engine.py     # 阶段 2 批量生成一致性（CPU）
+tests/test_paged_generation.py # 阶段 2 GPU 验收
+tests/test_generate_paged_log.py # 阶段 2 日志格式（CPU）
 experiments/log.md       # 每次实验记录
 out/                     # 基线/基准输出（gitignored，可在 GPU 主机重新生成）
 ```
@@ -63,6 +81,12 @@ python tools/bench.py --model Qwen/Qwen3-0.6B --load all --append-log --log-stag
 # 阶段 1 的 naive 生成 / 长度基准同样支持 --append-log
 python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
     --bench-lengths 128,256,512,1024,2048 --append-log --log-stage 1
+# 阶段 2 paged 批量生成 / batch·序列长度基准，同样支持 --append-log
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --page-size 16
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
+    --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
+    --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2
 
 black . && ruff check . --fix && mypy python/minisgl   # 与参考仓库一致的 lint 栈
 ```
@@ -74,7 +98,7 @@ black . && ruff check . --fix && mypy python/minisgl   # 与参考仓库一致�
 ## 阶段工作流（每个阶段都执行）
 
 1. 只读本阶段对应的 1–3 个模块 + 路线图对应小节，先画数据流再写代码。
-2. 先定接口（`BaseOP`、`BaseAttnBackend`/`BaseAttnMetadata`、`BasePrefixCache`/`BaseCacheHandle`、`BaseKVCachePool`），再填最朴素的 PyTorch 实现。
+2. 先定接口（`nn.Module` 基类、`BaseAttnBackend`/`BaseAttnMetadata`、`BasePrefixCache`/`BaseCacheHandle`、`BaseKVCachePool`），再填最朴素的 PyTorch 实现。
 3. 与上一阶段 / HF 黄金基线对齐，达到路线图 §2 中该阶段的**全部验收标准**才进入下一阶段。
 4. 固化一组性能数字并写入 `experiments/log.md`（日期、commit、配置、TTFT、ITL p50/p99、吞吐、峰值显存）。
 5. 每个优化都必须有开关（CLI flag 或环境变量），保证能一键回到上一阶段。

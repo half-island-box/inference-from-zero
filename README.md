@@ -10,6 +10,7 @@
 | --- | --- | --- |
 | 0 环境与黄金基线 | 脚手架完成，待在 GPU 上生成基线 | `tools/` + `tests/` + `experiments/log.md` |
 | 1 最小生成器 | 代码与 CPU 测试完成，待在 GPU 上验收 | `python/minisgl/` + `scripts/generate_naive.py` |
+| 2 KV Cache / 批量前向 | 代码与 CPU 测试完成，待在 GPU 上验收 | `kvcache/` + `attention/` + `scheduler/` + `scripts/generate_paged.py` |
 
 ## 环境要求
 
@@ -105,6 +106,37 @@ python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
 
 `--append-log` 同样适用于生成模式（不传 `--bench-lengths`），此时记录 20 条 prompt 的 prefill/decode 均值和峰值显存；`--log-stage` 默认 1，`--log-note` 填写「结论 / 下一步」。
 
+## 阶段 2：KV Cache、批量前向与 Paged Attention
+
+阶段 2 先把 `layers/` / `models/` 从 `BaseOP` 迁移到 `torch.nn.Module`，再实现：
+
+- `core.Req` / `Batch` / `Context` 状态机与全局 batch 上下文；
+- `kvcache/`：`(2, layers, pages + 1, page_size, kv_heads, head_dim)` 的 KV 池与占位前缀缓存；
+- `scheduler/`：请求槽位、页分配器（page_size 1/4/16）、batch 组装与静态调度循环；
+- `attention/`：可插拔 backend 接口与参考实现（gather KV + SDPA，支持 extend prefill 的 causal 偏移）。
+
+生成脚本与阶段 0/1 输出格式一致，可直接对比：
+
+```bash
+# CPU：迁移回归、页分配、attention 语义、批量生成一致性
+pytest tests/test_module_migration.py tests/test_kvcache_alloc.py \
+       tests/test_paged_engine.py tests/test_torch_attn.py -q
+
+# GPU：paged 批量生成 + 黄金基线对比
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B --model-source modelscope --page-size 16
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/paged/Qwen__Qwen3-0.6B/golden.json
+pytest tests/test_paged_generation.py -m "gpu and slow"
+
+# 不同 batch size / 序列长度的 decode 延迟与显存，写入 log.md 阶段 2
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
+    --bench-batch-sizes 1,2,4,8 --append-log --log-stage 2
+python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
+    --bench-seq-lens 128,256,512,1024 --append-log --log-stage 2
+```
+
+`--page-size` 切换 1/4/16 时输出必须逐 token 一致；`--num-pages 0`（默认）会按负载与空闲显存自动估算页数。
+
 ## 采样语义（后续所有阶段复用）
 
 - 每条请求最多生成 `max_tokens` 个 token；
@@ -116,12 +148,16 @@ python scripts/generate_naive.py --model Qwen/Qwen3-0.6B \
 
 ```
 python/minisgl/          # 自己的引擎实现
-  core.py                # SamplingParams
-  layers/                # BaseOP、RMSNorm、Linear、RoPE、Attention、Embedding
+  core.py                # SamplingParams、Req / Batch / Context
+  layers/                # nn.Module：RMSNorm、Linear、RoPE、Attention、Embedding
   models/                # 配置、Llama/Qwen3、safetensors 权重加载
+  kvcache/               # KV 池（MHA）、前缀缓存接口、naive 前缀缓存
+  attention/             # attention backend 接口与 torch 参考实现
+  scheduler/             # 请求槽位、页分配器、batch 组装、静态调度循环
   engine/                # greedy 采样与 naive 生成循环
 scripts/
   generate_naive.py      # 阶段 1 生成/对比/序列长度 benchmark
+  generate_paged.py      # 阶段 2 paged 批量生成/对比/batch·长度 benchmark
 tools/
   reference_hf.py        # 黄金基线：greedy 生成 + logits
   compare.py             # 与基线对比（token 精确 / logits 容差）
@@ -136,6 +172,12 @@ tests/
   test_model.py          # 层/模型前向对齐 HF、权重映射（CPU）
   test_naive_generate.py # naive 生成语义（CPU）
   test_naive_generation.py # 阶段 1 GPU 验收
+  test_module_migration.py # nn.Module 迁移与严格加载（CPU）
+  test_kvcache_alloc.py  # 页分配、跨页与完整性（CPU）
+  test_torch_attn.py     # extend prefill 的 causal 偏移（CPU）
+  test_paged_engine.py   # 批量生成与阶段 1 一致（CPU）
+  test_paged_generation.py # 阶段 2 GPU 验收
+  test_generate_paged_log.py # 阶段 2 日志格式（CPU）
 experiments/log.md       # 实验记录
 ```
 
@@ -147,7 +189,7 @@ pytest -m "gpu and slow"     # 在 GPU 主机上跑端到端回归
 pytest tests/test_compare.py::test_token_mismatch_fails
 ```
 
-CPU 测试不下载权重，使用随机初始化的小 Llama 验证缓存与停止语义。
+CPU 测试不下载权重，使用随机初始化的小 Llama / Qwen3 验证缓存、页分配与停止语义。
 
 ## 与参考实现的关系
 
