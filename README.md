@@ -28,7 +28,7 @@ uv pip install -e ".[dev]"
 python -c "import torch; print(torch.cuda.get_device_name(0))"
 ```
 
-模型默认从 ModelScope 下载（`uv pip install -e ".[dev]"` 已包含 `modelscope`）；如需改用 HuggingFace，加 `--model-source huggingface`。
+模型默认从 ModelScope 下载（`uv pip install -e ".[dev]"` 已包含 `modelscope`）；如需改用 HuggingFace，加 `--model-source huggingface`。两者都默认下载到 `~/data`，可用环境变量 `MINISGL_MODEL_DIR` 覆盖。
 
 ## 阶段 0：黄金基线
 

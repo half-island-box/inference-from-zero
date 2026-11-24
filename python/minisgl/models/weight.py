@@ -24,19 +24,34 @@ _MERGE_GROUPS: dict[str, tuple[str, str, tuple[str, ...]]] = {
 }
 
 
+_DEFAULT_MODEL_DIR = "~/data"
+
+
+def model_cache_dir() -> str:
+    """模型下载根目录：默认 ``~/data``，可用 ``MINISGL_MODEL_DIR`` 覆盖。"""
+    return os.path.expanduser(os.getenv("MINISGL_MODEL_DIR", _DEFAULT_MODEL_DIR))
+
+
 def resolve_model_path(model: str, model_source: str = "modelscope") -> str:
     if os.path.isdir(model):
         return model
+    cache_dir = model_cache_dir()
     if model_source == "modelscope":
         try:
             from modelscope import snapshot_download
         except ImportError as exc:  # pragma: no cover - depends on install
             raise SystemExit("modelscope is required: uv pip install -e '.[modelscope]'") from exc
-        return str(snapshot_download(model))
+        return str(snapshot_download(model, cache_dir=cache_dir))
     if model_source == "huggingface":
         from huggingface_hub import snapshot_download
 
-        return str(snapshot_download(model, allow_patterns=["*.safetensors", "*.json", "*.txt"]))
+        return str(
+            snapshot_download(
+                model,
+                cache_dir=cache_dir,
+                allow_patterns=["*.safetensors", "*.json", "*.txt"],
+            )
+        )
     raise ValueError(f"unknown model source: {model_source!r}")
 
 

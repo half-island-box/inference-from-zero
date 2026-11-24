@@ -6,6 +6,7 @@ GPU 环境时依然可以导入。
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,17 +37,28 @@ class HFRuntime:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
+_DEFAULT_MODEL_DIR = "~/data"
+
+
+def model_cache_dir() -> str:
+    """模型下载根目录：默认 ``~/data``，可用 ``MINISGL_MODEL_DIR`` 覆盖。"""
+    return os.path.expanduser(os.getenv("MINISGL_MODEL_DIR", _DEFAULT_MODEL_DIR))
+
+
 def resolve_model_path(model_name: str, model_source: str) -> str:
-    if model_source == "huggingface":
+    if os.path.isdir(model_name):
         return model_name
+    cache_dir = model_cache_dir()
+    if model_source == "huggingface":
+        from huggingface_hub import snapshot_download
+
+        return str(snapshot_download(model_name, cache_dir=cache_dir))
     if model_source == "modelscope":
         try:
             from modelscope import snapshot_download
         except ImportError as exc:  # pragma: no cover - depends on install
-            raise SystemExit(
-                "--model-source modelscope requires `pip install modelscope`"
-            ) from exc
-        return str(snapshot_download(model_name))
+            raise SystemExit("--model-source modelscope requires `pip install modelscope`") from exc
+        return str(snapshot_download(model_name, cache_dir=cache_dir))
     raise ValueError(f"unknown model source: {model_source!r}")
 
 
@@ -169,12 +181,10 @@ class GreedyDecoder:
 
     def prefill(self) -> None:
         torch = _import_torch()
-        ids = torch.tensor(
-            [self.input_ids], dtype=torch.long, device=self.runtime.device
-        )
+        ids = torch.tensor([self.input_ids], dtype=torch.long, device=self.runtime.device)
         out = _forward(self.runtime.model, ids, use_cache=True)
         self.past_key_values = out.past_key_values
-        self.logits = out.logits[:, -1, :].float() # 返回最后一个token的logits
+        self.logits = out.logits[:, -1, :].float()  # 返回最后一个token的logits
 
     def peek(self) -> int:
         if self.logits is None:
