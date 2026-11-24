@@ -50,6 +50,7 @@ from minisgl.scheduler import BatchRequest, PagedEngine
 from transformers import AutoConfig, AutoTokenizer
 
 from tools.logbook import git_commit, gpu_env, insert_log_entry
+from tools.memory import peak_memory_gb, reset_peak_memory
 from tools.workloads import PROMPTS
 
 
@@ -190,7 +191,11 @@ def _meta(args: argparse.Namespace, model_path: str, hf_config: Any) -> dict[str
         "page_size": args.page_size,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
-        "cuda_device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None,
+        "cuda_device": (
+            torch.cuda.get_device_name(torch.device(args.device))
+            if args.device.startswith("cuda")
+            else None
+        ),
         "architectures": getattr(hf_config, "architectures", None),
     }
 
@@ -313,8 +318,7 @@ def run_generation(
                 BatchRequest(ids, SamplingParams(max_tokens=1, ignore_eos=True)) for _, ids in chunk
             ]
             _run_warmup(engine, warm_requests, args.warmup, eos_token_id)
-            if args.device.startswith("cuda"):
-                torch.cuda.reset_peak_memory_stats()
+            reset_peak_memory(engine.device)
         run = engine.generate(requests, eos_token_id=eos_token_id)
         prefill_ms.append(run.prefill_ms)
         if run.decode_ms:
@@ -361,9 +365,8 @@ def run_generation(
     golden_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     np.savez_compressed(out_dir / "logits.npz", **logits_by_id)
 
-    peak_gb = None
-    if args.device.startswith("cuda"):
-        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    peak_gb = peak_memory_gb(engine.device)
+    if peak_gb is not None:
         print(f"peak memory: {peak_gb:.2f} GB")
     print(f"wrote {golden_json} and {out_dir / 'logits.npz'}")
     return {
@@ -395,11 +398,10 @@ def _bench_one(
         BatchRequest([token_id] * seq_len, SamplingParams(max_tokens=max_tokens, ignore_eos=True))
         for _ in range(batch_size)
     ]
-    if engine.device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats()
+    reset_peak_memory(engine.device)
     run = engine.generate(requests, eos_token_id=None)
     engine.check_integrity()
-    peak = torch.cuda.max_memory_allocated() / 1e9 if engine.device.type == "cuda" else None
+    peak = peak_memory_gb(engine.device)
     return {
         "prefill_ms": run.prefill_ms,
         "decode_mean_ms": _mean(run.decode_ms),

@@ -49,6 +49,7 @@ from minisgl.models import (
 from transformers import AutoConfig, AutoTokenizer
 
 from tools.logbook import git_commit, gpu_env, insert_log_entry
+from tools.memory import peak_memory_gb, reset_peak_memory
 from tools.workloads import PROMPTS
 
 
@@ -134,7 +135,11 @@ def _meta(args: argparse.Namespace, model_path: str, hf_config: Any) -> dict:
         "device": args.device,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
-        "cuda_device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None,
+        "cuda_device": (
+            torch.cuda.get_device_name(torch.device(args.device))
+            if args.device.startswith("cuda")
+            else None
+        ),
         "architectures": getattr(hf_config, "architectures", None),
     }
 
@@ -199,8 +204,7 @@ def run_generation(
 
     cases: list[dict] = []
     logits_by_id: dict[str, np.ndarray] = {}
-    if args.device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
+    reset_peak_memory(args.device)
 
     for index, prompt in enumerate(prompts):
         case_id = f"p{index:02d}"
@@ -252,9 +256,8 @@ def run_generation(
     golden_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     np.savez_compressed(out_dir / "logits.npz", **logits_by_id)
 
-    peak_gb = None
-    if args.device.startswith("cuda"):
-        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    peak_gb = peak_memory_gb(args.device)
+    if peak_gb is not None:
         print(f"peak memory: {peak_gb:.2f} GB")
     print(f"wrote {golden_json} and {out_dir / 'logits.npz'}")
 

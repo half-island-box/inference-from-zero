@@ -40,6 +40,7 @@ from minisgl.core import SamplingParams
 from minisgl.llm import LLM
 
 from tools.logbook import git_commit, gpu_env, insert_log_entry
+from tools.memory import peak_memory_gb, reset_peak_memory
 from tools.workloads import PROMPTS
 
 
@@ -140,7 +141,11 @@ def _meta(args: argparse.Namespace, llm: LLM) -> dict[str, Any]:
         "sched_policy": llm.scheduler.sched_policy,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
-        "cuda_device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None,
+        "cuda_device": (
+            torch.cuda.get_device_name(torch.device(args.device))
+            if args.device.startswith("cuda")
+            else None
+        ),
     }
 
 
@@ -170,10 +175,6 @@ def _warmup(llm: LLM, args: argparse.Namespace, token_id: int) -> None:
         )
 
 
-def _peak_gb(device: torch.device) -> float | None:
-    return torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else None
-
-
 def run_generation(args: argparse.Namespace, llm: LLM, meta: dict[str, Any]) -> str:
     tokenizer = llm.tokenizer
     assert tokenizer is not None
@@ -186,8 +187,7 @@ def run_generation(args: argparse.Namespace, llm: LLM, meta: dict[str, Any]) -> 
         raise SystemExit("tokenizer produced an empty sequence")
 
     _warmup(llm, args, min(1000, llm.engine.model_config.vocab_size - 1))
-    if args.device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
+    reset_peak_memory(llm.engine.device)
 
     params = SamplingParams(max_tokens=args.max_tokens, ignore_eos=args.ignore_eos)
     start = time.perf_counter()
@@ -241,7 +241,7 @@ def run_generation(args: argparse.Namespace, llm: LLM, meta: dict[str, Any]) -> 
     )
     np.savez_compressed(out_dir / "logits.npz", **logits_by_id)
 
-    peak = _peak_gb(llm.engine.device)
+    peak = peak_memory_gb(llm.engine.device)
     stats = {
         "num_requests": len(cases),
         "wall_s": wall_s,
@@ -288,15 +288,14 @@ def _summarize(results: list[dict[str, Any]], wall_s: float, device: torch.devic
         "itl_p50": _percentile(itls, 50),
         "itl_p99": _percentile(itls, 99),
         "throughput": total_tokens / wall_s if wall_s > 0 else None,
-        "peak_memory_gb": _peak_gb(device),
+        "peak_memory_gb": peak_memory_gb(device),
     }
 
 
 def run_bench(args: argparse.Namespace, llm: LLM, meta: dict[str, Any]) -> str:
     prompts, params = _make_bench_requests(args, llm)
     _warmup(llm, args, min(1000, llm.engine.model_config.vocab_size - 1))
-    if args.device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
+    reset_peak_memory(llm.engine.device)
 
     start = time.perf_counter()
     results = llm.generate(prompts, params)
@@ -307,8 +306,7 @@ def run_bench(args: argparse.Namespace, llm: LLM, meta: dict[str, Any]) -> str:
 
     serial = None
     if args.bench_serial:
-        if args.device.startswith("cuda"):
-            torch.cuda.reset_peak_memory_stats()
+        reset_peak_memory(llm.engine.device)
         start = time.perf_counter()
         serial_results: list[dict[str, Any]] = []
         for prompt, param in zip(prompts, params):

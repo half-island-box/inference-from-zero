@@ -247,6 +247,7 @@ tools/
   bench.py               # TTFT / ITL / 吞吐 / 峰值显存
   workloads.py           # 20 条固定 prompt + 7 组固定负载
   hf_runtime.py          # 共用的 HF 加载与 greedy 解码
+  memory.py              # CUDA 显存统计（显式绑定 --device，避免读到 0 号卡）
 tests/
   test_reference.py      # GPU 端到端回归（gpu + slow）
   test_hf_runtime.py     # CPU 小模型解码语义测试
@@ -266,6 +267,7 @@ tests/
   test_continuous_generation.py # 阶段 3 GPU 验收
   test_chunked_prefill.py # 分块预填充语义（CPU）
   test_model_dir.py      # 模型下载目录解析（CPU）
+  test_memory.py         # 显存统计绑定设备（CPU）
 experiments/log.md       # 实验记录
 ```
 

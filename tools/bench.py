@@ -35,6 +35,7 @@ if __package__ in (None, ""):
 
 from tools.hf_runtime import GreedyDecoder, HFRuntime, load_hf_runtime
 from tools.logbook import git_commit, gpu_env, insert_log_entry
+from tools.memory import peak_memory_gb, reset_peak_memory
 from tools.workloads import LOADS, Load, get_load, make_input_ids
 
 
@@ -120,7 +121,6 @@ def bench_request(runtime: HFRuntime, input_ids: list[int], max_tokens: int) -> 
 
 # 装载runtime和一个load，遍历load中的seq进行bench_request
 def bench_load(runtime: HFRuntime, load: Load, seed: int = 0, warmup: int = 1) -> dict[str, Any]:
-    import torch
 
     inputs = make_input_ids(load, seed=seed)
 
@@ -131,8 +131,7 @@ def bench_load(runtime: HFRuntime, load: Load, seed: int = 0, warmup: int = 1) -
             bench_request(runtime, warm_ids, 2)
         _sync(runtime)
 
-    if runtime.device.startswith("cuda"):
-        torch.cuda.reset_peak_memory_stats()
+    reset_peak_memory(runtime.device)
 
     wall_start = time.perf_counter()
     results = [
@@ -142,9 +141,7 @@ def bench_load(runtime: HFRuntime, load: Load, seed: int = 0, warmup: int = 1) -
     _sync(runtime)
     wall_s = time.perf_counter() - wall_start
 
-    peak_gb = None
-    if runtime.device.startswith("cuda"):
-        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+    peak_gb = peak_memory_gb(runtime.device)
 
     ttfts = [result["ttft_ms"] for result in results]
     itls = [ms for result in results for ms in result["itl_ms"]]

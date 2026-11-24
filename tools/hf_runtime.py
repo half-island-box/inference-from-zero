@@ -111,7 +111,9 @@ def load_hf_runtime(
         "attn_implementation": attn_implementation,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
-        "cuda_device": torch.cuda.get_device_name(0) if device == "cuda" else None,
+        "cuda_device": (
+            torch.cuda.get_device_name(torch.device(device)) if device.startswith("cuda") else None
+        ),
         "num_parameters": sum(p.numel() for p in model.parameters()),
         "eos_token_id": eos_token_id,
     }

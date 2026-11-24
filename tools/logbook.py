@@ -31,9 +31,10 @@ def gpu_env(meta: dict[str, Any], device: str) -> str:
     """组装「GPU / 驱动 / torch / transformers」单行环境信息。"""
     if device.startswith("cuda"):
         name = meta.get("cuda_device") or device
+        target = meta.get("device") or device
         driver_raw = _run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
         driver = driver_raw.splitlines()[0].strip() if driver_raw else "?"
-        gpu = f"{name} / driver {driver}"
+        gpu = f"{name} ({target}) / driver {driver}"
     else:
         gpu = f"device {device}（非 CUDA，仅 CPU 参考）"
     return f"{gpu} / torch {meta['torch_version']} / transformers {meta['transformers_version']}"
