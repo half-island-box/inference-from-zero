@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本仓库是**从零复现 mini-sglang 推理引擎**的工程，按 [reproduction-roadmap.zh-CN.md](reproduction-roadmap.zh-CN.md) 分 13 个阶段（阶段 0–12）推进。路线图是唯一的规格来源：每个阶段的目标、要实现的模块、验收标准、常见坑都在里面，动手前先读对应阶段。
 
 - **参考实现（只读）**：`/Users/bj/Coding/github/mini-sglang`（upstream `sgl-project/mini-sglang`，当前 `9a91cfa`）。其中 `docs/features.zh-CN.md`、`docs/structures.zh-CN.md`、`docs/reproduction-roadmap.zh-CN.md` 是本地未提交的中文文档。
-- **当前状态**：阶段 0 脚手架完成；阶段 1 最小生成器、阶段 2（`nn.Module`、KV Cache、批量前向、Paged Attention）、阶段 3（连续批处理、每请求采样、离线 LLM）、阶段 4（chunked prefill、`--sched-policy`）的代码与 CPU 测试完成。阶段 1–4 的 GPU 验收仍需在 GPU 主机上运行黄金基线对比与压测。
+- **当前状态**：阶段 0 脚手架完成；阶段 1 最小生成器、阶段 2（`nn.Module`、KV Cache、批量前向、Paged Attention）、阶段 3（连续批处理、每请求采样、离线 LLM）、阶段 4（chunked prefill、`--sched-policy`）、阶段 5（radix 前缀缓存、`--cache-type`）的代码与 CPU 测试完成。阶段 1–5 的 GPU 验收仍需在 GPU 主机上运行黄金基线对比与压测。
 - 代码应写在**本仓库**；参考仓库只用于卡住后对照接口和关键函数，不要整段搬运。先自己写，再 diff。
 
 ## 运行环境
@@ -33,7 +33,7 @@ python/minisgl/          # 自己的实现，模块划分与参考实现一致
   core.py                # SamplingParams、Req / Batch / Context
   layers/                # nn.Module：RMSNorm、Linear、RoPE、Attention、Embedding
   models/                # 配置、Llama/Qwen3、safetensors 权重加载
-  kvcache/               # KV 池、前缀缓存接口、naive 前缀缓存
+  kvcache/               # KV 池、前缀缓存接口、naive / radix 前缀缓存
   attention/             # attention backend 接口与 torch 参考实现
   scheduler/             # 连续批处理：prefill/decode 管理、页分配、主循环
   engine/                # Engine、采样器、naive 生成循环
@@ -41,7 +41,7 @@ python/minisgl/          # 自己的实现，模块划分与参考实现一致
   env.py                 # MINISGL_* 环境变量开关
 scripts/generate_naive.py # 阶段 1：生成 / 对比 / 长度基准
 scripts/generate_paged.py # 阶段 2：paged 批量生成 / 对比 / batch·长度基准
-scripts/generate_continuous.py # 阶段 3：连续批处理生成 / 并发·串行压测
+scripts/generate_continuous.py # 阶段 3–5：连续批处理 / 分块预填充 / 前缀缓存生成与压测
 tools/reference_hf.py    # 黄金基线：HF greedy 生成 + logits
 tools/compare.py         # 与黄金输出对比（token 精确 / logits 容差）
 tools/bench.py           # TTFT / ITL / 吞吐 / 峰值显存
@@ -64,7 +64,9 @@ tests/test_sampler.py          # 阶段 3 每请求采样（CPU）
 tests/test_continuous_scheduler.py # 阶段 3 连续批处理语义（CPU）
 tests/test_continuous_generation.py # 阶段 3/4 GPU 验收
 tests/test_chunked_prefill.py  # 阶段 4 分块预填充语义（CPU）
+tests/test_radix_cache.py      # 阶段 5 前缀缓存语义与 cache on/off（CPU）
 tests/test_model_dir.py        # 模型下载目录解析（CPU）
+tests/test_memory.py           # 显存统计绑定设备（CPU）
 experiments/log.md       # 每次实验记录
 out/                     # 基线/基准输出（gitignored，可在 GPU 主机重新生成）
 ```
@@ -103,6 +105,11 @@ python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
     --page-size 16 --max-running-req 50 --bench-num-requests 200 \
     --bench-input-len 256 --bench-output-len 32 --bench-mixed --bench-serial \
     --warmup 1 --append-log --log-stage 3
+# 阶段 5 前缀缓存：--cache-type radix，配合共享前缀流量观察 TTFT 下降
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --page-size 16 --max-prefill-length 2048 --cache-type radix \
+    --bench-num-requests 8 --bench-shared-prefix 4096 --bench-input-len 64 \
+    --bench-output-len 16 --warmup 1 --append-log --log-stage 5
 
 black . && ruff check . --fix && mypy python/minisgl   # 与参考仓库一致的 lint 栈
 ```

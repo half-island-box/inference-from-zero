@@ -32,7 +32,9 @@ class CacheManager:
     ) -> None:
         device = page_table.device
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        self.prefix_cache: BasePrefixCache = create_prefix_cache(device=device, type=type)
+        self.prefix_cache: BasePrefixCache = create_prefix_cache(
+            device=device, type=type, page_size=page_size
+        )
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -74,8 +76,15 @@ class CacheManager:
         old_handle = req.cache_handle
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
         self.unlock(old_handle)
-        # 这段已经由前缀缓存接管，释放本请求重复分配的部分
-        self._free(page_indices[old_handle.cached_len : cached_len])
+        # [old, cached_len) 已被其他请求抢先缓存：先把页表指向共享槽位，再释放自己的重复页。
+        # 否则请求继续 decode 时仍会读这些马上被回收的页，显存压力下会被覆盖。
+        duplicate = page_indices[old_handle.cached_len : cached_len].clone()
+        if not finished and cached_len > old_handle.cached_len:
+            matched = new_handle.get_matched_indices()
+            self.page_table[req.table_idx, old_handle.cached_len : cached_len] = matched[
+                old_handle.cached_len : cached_len
+            ]
+        self._free(duplicate)
         if finished:
             # 请求结束，尾部未插入缓存的页也要释放
             self._free(page_indices[new_handle.cached_len :])

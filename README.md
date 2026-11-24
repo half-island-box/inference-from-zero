@@ -13,6 +13,7 @@
 | 2 KV Cache / 批量前向 | 代码与 CPU 测试完成，待在 GPU 上验收 | `kvcache/` + `attention/` + `scheduler/` + `scripts/generate_paged.py` |
 | 3 连续批处理 | 代码与 CPU 测试完成，待在 GPU 上验收 | `scheduler/` + `engine/engine.py` + `llm/` + `scripts/generate_continuous.py` |
 | 4 分块预填充 | 代码与 CPU 测试完成，待在 GPU 上验收 | `scheduler/prefill.py` + `--max-prefill-length` + `--sched-policy` |
+| 5 前缀缓存 | 代码与 CPU 测试完成，待在 GPU 上验收 | `kvcache/radix_cache.py` + `--cache-type radix` |
 
 ## 环境要求
 
@@ -217,6 +218,40 @@ done
 
 `--bench-long-input-len 32768 --bench-num-requests 9 --bench-input-len 64` 用来构造「1 条 32k prompt + 8 条短请求并发」，验证分块后不 OOM 且 decode 能插入 chunk 之间。
 
+## 阶段 5：前缀缓存（Naive → Radix）
+
+阶段 5 不改变 KV 池与页表抽象，只替换前缀缓存实现：
+
+- `kvcache/radix_cache.py`：按页对齐的 radix 树，节点保存 token key 与物理 KV 槽位；匹配时按页比较、必要时分裂节点，插入长度向下对齐到 `page_size`；
+- `lock/unlock` 维护 `ref_count`：被请求占用的节点计入 `protected`，无引用叶子按时间戳 LRU 淘汰，`evict` 以整节点归还页起点；
+- `CacheManager.cache_req` 在 prefill 结束 / 请求结束时插入前缀，释放被其他请求抢先缓存的重复页与请求尾部；
+- `--cache-type naive|radix` 一键对照：naive 永远不命中、不淘汰，radix 才做跨请求复用。
+
+```bash
+# CPU：radix 树单测（匹配 / 分裂 / 锁 / 淘汰）+ cache on/off 一致性
+pytest tests/test_radix_cache.py -q
+
+# GPU：page_size 1/4/8 下 radix 与阶段 0 黄金基线逐 token 一致
+for ps in 1 4 8; do
+  python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+      --page-size $ps --cache-type radix --warmup 1 \
+      --output out/radix_ps$ps/Qwen__Qwen3-0.6B
+  python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                          --actual out/radix_ps$ps/Qwen__Qwen3-0.6B/golden.json
+done
+
+# GPU：4k 共享前缀 cache on/off 的 TTFT 对比，写入 log.md 阶段 5
+for cache in naive radix; do
+  python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+      --page-size 16 --max-prefill-length 2048 --cache-type $cache \
+      --bench-num-requests 8 --bench-shared-prefix 4096 --bench-input-len 64 \
+      --bench-output-len 16 --warmup 1 --append-log --log-stage 5 \
+      --log-note "阶段 5 4k 共享前缀 cache=$cache"
+done
+```
+
+`--bench-shared-prefix N` 让所有 bench 请求共享 N 个 token 的前缀；配合 `--max-prefill-length` 小于前缀长度，可确保请求逐个准入，从而观察到第二个及后续请求的 TTFT 下降。
+
 ## 采样语义（后续所有阶段复用）
 
 - 每条请求最多生成 `max_tokens` 个 token；
@@ -231,7 +266,7 @@ python/minisgl/          # 自己的引擎实现
   core.py                # SamplingParams、Req / Batch / Context
   layers/                # nn.Module：RMSNorm、Linear、RoPE、Attention、Embedding
   models/                # 配置、Llama/Qwen3、safetensors 权重加载
-  kvcache/               # KV 池（MHA）、前缀缓存接口、naive 前缀缓存
+  kvcache/               # KV 池（MHA）、前缀缓存接口、naive / radix 前缀缓存
   attention/             # attention backend 接口与 torch 参考实现
   scheduler/             # 连续批处理：prefill/decode 管理、页分配、主循环
   engine/                # Engine（forward_batch）、采样器、naive 生成循环
@@ -240,7 +275,7 @@ python/minisgl/          # 自己的引擎实现
 scripts/
   generate_naive.py      # 阶段 1 生成/对比/序列长度 benchmark
   generate_paged.py      # 阶段 2 paged 批量生成/对比/batch·长度 benchmark
-  generate_continuous.py # 阶段 3 连续批处理生成/并发·串行压测
+  generate_continuous.py # 阶段 3–5 连续批处理 / 分块预填充 / 前缀缓存生成与压测
 tools/
   reference_hf.py        # 黄金基线：greedy 生成 + logits
   compare.py             # 与基线对比（token 精确 / logits 容差）
@@ -266,6 +301,7 @@ tests/
   test_continuous_scheduler.py # 连续批处理语义（CPU）
   test_continuous_generation.py # 阶段 3 GPU 验收
   test_chunked_prefill.py # 分块预填充语义（CPU）
+  test_radix_cache.py    # 前缀缓存匹配/分裂/淘汰与 cache on/off（CPU）
   test_model_dir.py      # 模型下载目录解析（CPU）
   test_memory.py         # 显存统计绑定设备（CPU）
 experiments/log.md       # 实验记录

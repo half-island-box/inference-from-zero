@@ -39,11 +39,17 @@ def create_kvcache_pool(
     )
 
 
-def create_prefix_cache(device: torch.device, type: str = "naive") -> BasePrefixCache:
+def create_prefix_cache(
+    device: torch.device, type: str = "naive", page_size: int = 1
+) -> BasePrefixCache:
     if type == "naive":
         from .naive_cache import NaivePrefixCache
 
         return NaivePrefixCache(device=device)
+    if type == "radix":
+        from .radix_cache import RadixPrefixCache
+
+        return RadixPrefixCache(device=device, page_size=page_size)
     raise ValueError(f"unsupported prefix cache type: {type!r}")
 
 

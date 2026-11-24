@@ -1000,6 +1000,78 @@ python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
 - 参照 `tests/core/test_cache_allocate.py` 写页对齐测试。
 - 空闲时 `check_integrity()` 不报错。
 
+**阶段架构图**
+
+```mermaid
+flowchart TB
+    subgraph ADMIT["PrefillAdder 准入"]
+        MATCH["CacheManager.match_prefix(input_ids[:-1])"] --> HIT["RadixCacheHandle<br/>cached_len（页对齐）"]
+        HIT --> CAP["容量 = extend_len + output_len + inflight"]
+        CAP --> LOCK["lock(handle)：路径上 ref_count++"]
+        LOCK --> COPY["page_table[:cached_len] ← get_matched_indices()"]
+    end
+
+    subgraph RADIX["RadixPrefixCache"]
+        WALK["_tree_walk：按首个页 key 找子节点<br/>逐 token 比较，必要时 split_at"]
+        INSERT["insert_prefix：长度向下对齐 page_size<br/>新节点保存 key + 物理槽位（clone）"]
+        LOCKAPI["lock / unlock：ref_count 0↔1<br/>维护 evictable / protected 计数"]
+        EVICT["evict：从无引用叶子按时间戳 LRU<br/>整节点淘汰，父节点变叶子后入堆"]
+        WALK --> INSERT
+        LOCK --> LOCKAPI
+    end
+
+    subgraph CACHEM["CacheManager.cache_req（prefill 结束 / 请求结束）"]
+        INS["insert_prefix(input_ids[:cached_len],<br/>page_table[:cached_len])"]
+        UNLOCK["unlock(old_handle)"]
+        FREE1["free [old_handle.cached_len, 新命中长度)<br/>被其他请求抢先缓存的重复页"]
+        FIN{"finished?"}
+        FREE2["free 尾部 [new_handle.cached_len, cached_len)"]
+        KEEP["req.cache_handle = new_handle<br/>lock(new_handle)"]
+        INS --> UNLOCK --> FREE1 --> FIN
+        FIN -->|"是"| FREE2
+        FIN -->|"否"| KEEP
+    end
+
+    ADMIT --> CACHEM
+    ALLOC["CacheManager.allocate_paged"] -->|"free_slots 不足"| EVICT
+    EVICT -->|"归还页起点"| ALLOC
+```
+
+> 无锁（naive）实现作为对照保留：`--cache-type naive|radix`。匹配长度、插入长度、页表槽位全部按 `page_size` 对齐；只有完整 prefill 结束（或请求结束）才调用 `cache_req`，chunked 中间态不进树。
+
+**测试命令**
+
+```bash
+# 0. CPU：radix 树单测（匹配 / 分裂 / 锁 / 淘汰）+ cache on/off 一致性
+pytest tests/test_radix_cache.py -q
+pytest -q -m "not gpu"
+
+# 1. GPU：cache on/off + page_size 1/4/8 输出逐 token 一致
+for ps in 1 4 8; do
+  python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+      --page-size $ps --cache-type radix --warmup 1 \
+      --output out/radix_ps$ps/Qwen__Qwen3-0.6B
+  python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                          --actual out/radix_ps$ps/Qwen__Qwen3-0.6B/golden.json
+done
+
+# 2. GPU：4k 共享前缀，cache on/off 的 TTFT 对比，写入 log.md 阶段 5
+for cache in naive radix; do
+  python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+      --page-size 16 --max-prefill-length 2048 --cache-type $cache \
+      --bench-num-requests 8 --bench-shared-prefix 4096 --bench-input-len 64 \
+      --bench-output-len 16 --warmup 1 --append-log --log-stage 5 \
+      --log-note "阶段 5 4k 共享前缀 cache=$cache"
+done
+
+# 3. GPU：小显存触发淘汰，输出正确且完整性检查通过
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --page-size 16 --num-pages 256 --cache-type radix \
+    --bench-num-requests 200 --bench-input-len 512 --bench-mixed \
+    --bench-output-len 32 --warmup 1 --append-log --log-stage 5 \
+    --log-note "阶段 5 小显存压力淘汰"
+```
+
 **常见坑**
 
 - 插入/匹配没有页对齐，导致半页数据进入树。
@@ -1009,6 +1081,7 @@ python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
 - 共享前缀的页表复制：命中部分要把旧 handle 的物理槽位复制到新请求的页表对应位置。
 - 匹配时用 `input_ids[:-1]`（最后一个 token 必须重新计算，否则拿不到它的 logits）。
 - 节点分裂后父/子引用计数错误。
+- 同批 prefill 的两条同前缀请求：后插入者释放「重复页」前，必须先把页表改指向缓存里的共享槽位，否则请求继续 decode 时会读到已被回收覆盖的页（小流量下看不出来，显存紧张时才暴露）。
 
 **阶段结束时的反思**
 
@@ -1064,8 +1137,7 @@ API Server ──ZMQ──▶ Tokenizer ──ZMQ──▶ Scheduler (rank 0)
   - 批量消息：`BatchTokenizerMsg` / `BatchBackendMsg` / `BatchFrontendMsg`。
 - **序列化**：msgpack + 类型注册。tensor 只传 CPU int32 一维张量；不要跨进程传 GPU tensor。
 - **ZMQ 模式**：API → Tokenizer 用 PUSH/PULL；Scheduler → 所有 rank 用 PUB/SUB（TP 阶段用到）；地址由 `SchedulerConfig._unique_suffix`（PID）派生，放在 `/tmp/minisgl_*`。
-- **增量 detokenize**：
-  - 累积 token ids，batch decode；
+- **增量 detokenize**： 
   - 处理不完整 UTF-8（末尾出现 `�` 时不要发送）；
   - 用"最后一个空格/中文边界"启发式避免输出半个单词；
   - 用 `read_offset` / `surr_offset` / `sent_offset` 记录已发送前缀，只发送增量；

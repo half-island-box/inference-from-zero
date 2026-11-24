@@ -76,7 +76,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-seq-len", type=int, default=0, help="0 = model max position")
     parser.add_argument("--memory-ratio", type=float, default=0.9)
-    parser.add_argument("--cache-type", default="naive", choices=("naive",))
+    parser.add_argument("--cache-type", default="naive", choices=("naive", "radix"))
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
@@ -90,6 +90,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help=">0 时第一条请求用该输入长度，其余用 --bench-input-len（测长 prompt + 短请求并发）",
     )
+    parser.add_argument(
+        "--bench-shared-prefix",
+        type=int,
+        default=0,
+        help=">0 时所有 bench 请求共享一段该长度的前缀（测前缀缓存命中）",
+    )
     parser.add_argument("--bench-output-len", type=int, default=32)
     parser.add_argument("--bench-mixed", action="store_true", help="输入长度在 1/4..全长度间随机")
     parser.add_argument("--bench-serial", action="store_true", help="额外测逐条串行吞吐")
@@ -100,7 +106,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.page_size < 1:
         parser.error("--page-size must be >= 1")
-    if args.max_tokens < 0 or args.bench_output_len < 0 or args.bench_long_input_len < 0:
+    if (
+        args.max_tokens < 0
+        or args.bench_output_len < 0
+        or args.bench_long_input_len < 0
+        or args.bench_shared_prefix < 0
+    ):
         parser.error("token counts must be >= 0")
     if args.max_running_req < 1:
         parser.error("--max-running-req must be >= 1")
@@ -261,17 +272,19 @@ def _make_bench_requests(
     args: argparse.Namespace, llm: LLM
 ) -> tuple[list[list[int]], list[SamplingParams]]:
     token_id = min(1000, llm.engine.model_config.vocab_size - 1)
+    tail_id = max(1, token_id - 1)
     rng = random.Random(args.seed)
     low = max(1, args.bench_input_len // 4)
+    shared = [token_id] * args.bench_shared_prefix
     prompts: list[list[int]] = []
     if args.bench_long_input_len > 0:
         # 第一条请求承担长 prompt，其余保持短输入，用来观察 chunk 与 decode 交错
-        prompts.append([token_id] * args.bench_long_input_len)
+        prompts.append(shared + [token_id] * args.bench_long_input_len)
     for _ in range(args.bench_num_requests - len(prompts)):
         length = (
             rng.randint(low, args.bench_input_len) if args.bench_mixed else args.bench_input_len
         )
-        prompts.append([token_id] * length)
+        prompts.append(shared + [tail_id] * length)
     params = [SamplingParams(max_tokens=args.bench_output_len, ignore_eos=True) for _ in prompts]
     return prompts, params
 
@@ -352,9 +365,10 @@ def format_bench_entry(
     meta: dict,
 ) -> str:
     lines = _log_header(args, meta, "连续批处理并发压测")
+    shared_note = f"共享前缀 {args.bench_shared_prefix} + " if args.bench_shared_prefix else ""
     long_note = f"首条 {args.bench_long_input_len} + " if args.bench_long_input_len else ""
     load = (
-        f"{args.bench_num_requests} 条请求，输入长度 {long_note}"
+        f"{args.bench_num_requests} 条请求，输入长度 {shared_note}{long_note}"
         f"{'1/4..' if args.bench_mixed else ''}{args.bench_input_len}，"
         f"输出 {args.bench_output_len}"
     )
