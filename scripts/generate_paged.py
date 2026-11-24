@@ -149,7 +149,7 @@ def _auto_num_pages(args: argparse.Namespace, config: ModelConfig, needed_tokens
     pages = math.ceil(needed_tokens / args.page_size) + 8
     if not args.device.startswith("cuda"):
         return max(pages, 256)
-    free_bytes, _ = torch.cuda.mem_get_info()
+    free_bytes, _ = torch.cuda.mem_get_info(torch.device(args.device))
     per_page = (
         2
         * config.num_layers

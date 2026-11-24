@@ -80,7 +80,7 @@ def _sync(runtime: HFRuntime) -> None:
     if runtime.device.startswith("cuda"):
         import torch
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(torch.device(runtime.device))
 
 
 def _percentile(values: list[float], q: float) -> float | None:

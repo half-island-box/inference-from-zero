@@ -41,3 +41,18 @@ def test_reset_noop_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     reset_peak_memory("cpu")
     assert calls == []
+
+
+def test_llm_free_memory_uses_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("transformers")
+    from minisgl.llm.llm import _free_memory_bytes
+
+    calls: list = []
+
+    def fake(device=None):  # noqa: ANN001
+        calls.append(device)
+        return 123, 456
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", fake)
+    assert _free_memory_bytes(torch.device("cuda:4")) == 123
+    assert calls == [torch.device("cuda:4")]

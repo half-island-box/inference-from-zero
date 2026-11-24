@@ -19,6 +19,11 @@ from minisgl.models import (
 from minisgl.scheduler.scheduler import Scheduler
 
 
+def _free_memory_bytes(device: torch.device) -> int:
+    """按实际设备查询空闲显存：``mem_get_info()`` 不传设备时读的是 current device。"""
+    return torch.cuda.mem_get_info(device)[0]
+
+
 class LLM:
     """离线批量生成。
 
@@ -67,7 +72,7 @@ class LLM:
         assert model_config is not None
         if num_pages is None:
             if self.device.type == "cuda":
-                free_bytes, _ = torch.cuda.mem_get_info()
+                free_bytes = _free_memory_bytes(self.device)
                 num_pages = Engine.num_pages_for(
                     model_config,
                     free_bytes=free_bytes,
