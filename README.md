@@ -12,6 +12,7 @@
 | 1 最小生成器 | 代码与 CPU 测试完成，待在 GPU 上验收 | `python/minisgl/` + `scripts/generate_naive.py` |
 | 2 KV Cache / 批量前向 | 代码与 CPU 测试完成，待在 GPU 上验收 | `kvcache/` + `attention/` + `scheduler/` + `scripts/generate_paged.py` |
 | 3 连续批处理 | 代码与 CPU 测试完成，待在 GPU 上验收 | `scheduler/` + `engine/engine.py` + `llm/` + `scripts/generate_continuous.py` |
+| 4 分块预填充 | 代码与 CPU 测试完成，待在 GPU 上验收 | `scheduler/prefill.py` + `--max-prefill-length` + `--sched-policy` |
 
 ## 环境要求
 
@@ -24,8 +25,22 @@
 ```bash
 uv venv --python=3.12
 source .venv/bin/activate
-uv pip install -e ".[dev]"
-python -c "import torch; print(torch.cuda.get_device_name(0))"
+uv pip install -e ".[dev]" --torch-backend=cu128
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+`--torch-backend=cu128` 让 uv 从 PyTorch 的 cu128 索引安装 torch。服务器驱动是 CUDA 12.8，
+直接装 PyPI 默认 wheel（新版 CUDA 编译）会报 “The NVIDIA driver on your system is too old”。
+想固化到 shell 里、之后不再带 flag：
+
+```bash
+echo 'export UV_TORCH_BACKEND=cu128' >> ~/.bashrc && source ~/.bashrc
+```
+
+已装坏的环境可以就地重装：
+
+```bash
+uv pip install --reinstall torch --torch-backend=cu128
 ```
 
 模型默认从 ModelScope 下载（`uv pip install -e ".[dev]"` 已包含 `modelscope`）；如需改用 HuggingFace，加 `--model-source huggingface`。两者都默认下载到 `~/data`，可用环境变量 `MINISGL_MODEL_DIR` 覆盖。
@@ -171,6 +186,37 @@ python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
 
 `--bench-serial` 会额外逐条运行同一组请求，日志中自动给出相对串行加速比；`--bench-num-requests 1000` 用于连续压测与完整性检查。
 
+## 阶段 4：分块预填充与调度策略
+
+阶段 4 把长 prompt 拆成多个 chunk 分轮计算：
+
+- `PrefillAdder` 按 `chunk = min(token_budget, remain_len)` 切块；没算完的请求生成 `ChunkedReq`，下一轮复用同一个 `table_idx` / `cached_len` / cache handle 继续；
+- `--max-prefill-length`（别名 `--max-extend-tokens`）控制每次 iteration 的 prefill token 预算；
+- `--sched-policy prefill_first|decode_first|interleave`：`interleave` 在 prefill 与 decode 同时可运行时交替调度，让 decode 插在两个 chunk 之间；
+- chunked 请求不采样、不写回 token_pool、不进 DecodeManager，也不提前插入前缀缓存；中止时正常释放已分配的页与槽位。
+
+```bash
+# CPU：分块语义（预算 / 页边界 / 中止 / 交错 / 活锁）
+pytest tests/test_chunked_prefill.py -q
+
+# GPU：分块预填充生成 + 黄金基线对比
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --model-source modelscope --page-size 16 --max-prefill-length 2048 --warmup 1
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/continuous/Qwen__Qwen3-0.6B/golden.json
+
+# chunk size 消融，写入 log.md 阶段 4
+for chunk in 512 2048 8192; do
+  python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+      --page-size 16 --max-running-req 50 --max-prefill-length $chunk \
+      --sched-policy interleave --bench-num-requests 16 \
+      --bench-input-len 4096 --bench-output-len 32 --bench-mixed \
+      --warmup 1 --append-log --log-stage 4
+done
+```
+
+`--bench-long-input-len 32768 --bench-num-requests 9 --bench-input-len 64` 用来构造「1 条 32k prompt + 8 条短请求并发」，验证分块后不 OOM 且 decode 能插入 chunk 之间。
+
 ## 采样语义（后续所有阶段复用）
 
 - 每条请求最多生成 `max_tokens` 个 token；
@@ -218,6 +264,8 @@ tests/
   test_sampler.py        # 每请求采样参数（CPU）
   test_continuous_scheduler.py # 连续批处理语义（CPU）
   test_continuous_generation.py # 阶段 3 GPU 验收
+  test_chunked_prefill.py # 分块预填充语义（CPU）
+  test_model_dir.py      # 模型下载目录解析（CPU）
 experiments/log.md       # 实验记录
 ```
 

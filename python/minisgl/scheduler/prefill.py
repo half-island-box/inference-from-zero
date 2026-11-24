@@ -1,4 +1,4 @@
-"""Prefill 管理：pending 队列、准入控制与组 batch（阶段 3 不分块）。"""
+"""Prefill 管理：pending 队列、准入控制、chunked prefill 与组 batch。"""
 
 from __future__ import annotations
 
@@ -20,7 +20,11 @@ if TYPE_CHECKING:
 
 
 class ChunkedReq(Req):
-    """阶段 4 启用；阶段 3 只保留类型定义。"""
+    """分块预填充的中间请求：只算一个 chunk，不采样、不产生输出。
+
+    ``input_ids`` 截断到当前 chunk 末尾，因此 ``device_len`` 就是本轮的 chunk 边界；
+    下一轮由 ``PrefillAdder`` 基于 ``cached_len`` 重新切块，不复用本对象。
+    """
 
     def append_host(self, next_token: torch.Tensor) -> None:
         raise NotImplementedError("ChunkedReq should not be sampled")
@@ -64,10 +68,6 @@ class PrefillAdder:
             return None
 
         table_idx = self.table_manager.allocate()
-        token_pool = self.table_manager.token_pool
-        token_pool[table_idx, cached_len : pending.input_len] = pending.input_ids[cached_len:].to(
-            token_pool.device
-        )
         if cached_len > 0:
             self.table_manager.page_table[table_idx, :cached_len] = handle.get_matched_indices()
         return handle, table_idx
@@ -77,14 +77,21 @@ class PrefillAdder:
         pending: PendingReq,
         handle: BaseCacheHandle,
         table_idx: int,
+        cached_len: int,
     ) -> Req:
-        cached_len = handle.cached_len
-        output_len, estimated_len = self._estimate(pending, cached_len)
-        # 阶段 3 不切块：单个请求可以超过 max_extend_tokens，避免活锁
-        self.token_budget -= pending.input_len - cached_len
-        self.reserved_size += estimated_len
-        return Req(
-            input_ids=pending.input_ids.clone(),
+        remain_len = pending.input_len - cached_len
+        chunk_size = min(self.token_budget, remain_len)
+        cls = ChunkedReq if chunk_size < remain_len else Req
+        output_len, _ = self._estimate(pending, cached_len)
+        self.token_budget -= chunk_size
+        # 预留整段剩余输入 + 输出：后续 chunk 不再重复做容量准入
+        self.reserved_size += remain_len + output_len + self.cache_manager.page_size - 1
+
+        start, end = cached_len, cached_len + chunk_size
+        token_pool = self.table_manager.token_pool
+        token_pool[table_idx, start:end] = pending.input_ids[start:end].to(token_pool.device)
+        return cls(
+            input_ids=pending.input_ids[:end],
             table_idx=table_idx,
             cached_len=cached_len,
             output_len=output_len,
@@ -94,11 +101,19 @@ class PrefillAdder:
         )
 
     def try_add_one(self, pending: PendingReq) -> Req | None:
-        resource = self._try_allocate_one(pending)
-        if resource is None:
+        if self.token_budget <= 0:
             return None
-        handle, table_idx = resource
-        return self._make_req(pending, handle, table_idx)
+
+        # 上一轮没算完的 chunk：复用 table_idx / cached_len / handle，不再匹配前缀
+        if chunked_req := pending.chunked_req:
+            return self._make_req(
+                pending, chunked_req.cache_handle, chunked_req.table_idx, chunked_req.cached_len
+            )
+
+        if resource := self._try_allocate_one(pending):
+            handle, table_idx = resource
+            return self._make_req(pending, handle, table_idx, handle.cached_len)
+        return None
 
 
 @dataclass
@@ -109,6 +124,10 @@ class PrefillManager:
     max_seq_len: int
     max_extend_tokens: int = 8192
     pending_list: list[PendingReq] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.max_extend_tokens < 1:
+            raise ValueError("max_extend_tokens must be >= 1 to guarantee prefill progress")
 
     def add_req(self, uid: int, input_ids: torch.Tensor, sampling_params) -> None:  # noqa: ANN001
         self.pending_list.append(
@@ -127,17 +146,20 @@ class PrefillManager:
             max_seq_len=self.max_seq_len,
         )
         reqs: list[Req] = []
+        chunked_list: list[PendingReq] = []
         for pending in self.pending_list:
-            if reqs and adder.token_budget <= 0:
-                break
             req = adder.try_add_one(pending)
             if req is None:
                 break  # FCFS：队首放不下就等下一轮
+            pending.chunked_req = req if isinstance(req, ChunkedReq) else None
+            if pending.chunked_req is not None:
+                chunked_list.append(pending)
             reqs.append(req)
 
         if not reqs:
             return None
-        self.pending_list = self.pending_list[len(reqs) :]
+        # chunked 请求留在队首，下一轮优先继续
+        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> Req | None:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""阶段 3：连续批处理（Scheduler + Engine + LLM）生成与压测。
+"""阶段 3/4：连续批处理 + 分块预填充的生成与压测。
 
 生成模式输出与阶段 0/1/2 相同的 JSON/NPZ，可直接用 ``tools/compare.py`` 对比::
 
@@ -7,11 +7,14 @@
     python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
                             --actual   out/continuous/Qwen__Qwen3-0.6B/golden.json
 
-压测模式测量并发吞吐、TTFT / ITL 与峰值显存，并写入阶段 3 实验日志::
+压测模式测量并发吞吐、TTFT / ITL 与峰值显存，并写入实验日志。阶段 4 用
+``--max-prefill-length`` 控制 chunk 大小，``--sched-policy interleave`` 让 decode
+插在 chunk 之间::
 
     python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
-        --bench-num-requests 200 --max-running-req 50 \
-        --append-log --log-stage 3
+        --max-prefill-length 2048 --sched-policy interleave \
+        --bench-long-input-len 32768 --bench-num-requests 9 --bench-input-len 64 \
+        --append-log --log-stage 4
 """
 
 from __future__ import annotations
@@ -56,7 +59,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--page-size", type=int, default=1)
     parser.add_argument("--num-pages", type=int, default=0, help="0 = auto from free memory")
     parser.add_argument("--max-running-req", type=int, default=16)
-    parser.add_argument("--max-extend-tokens", type=int, default=8192)
+    parser.add_argument(
+        "--max-extend-tokens",
+        "--max-prefill-length",
+        dest="max_extend_tokens",
+        type=int,
+        default=8192,
+        help="每次 iteration 的 prefill token 预算（chunk 大小）",
+    )
+    parser.add_argument(
+        "--sched-policy",
+        choices=("prefill_first", "decode_first", "interleave"),
+        default="prefill_first",
+        help="prefill / decode 均有请求时的调度策略",
+    )
     parser.add_argument("--max-seq-len", type=int, default=0, help="0 = model max position")
     parser.add_argument("--memory-ratio", type=float, default=0.9)
     parser.add_argument("--cache-type", default="naive", choices=("naive",))
@@ -67,6 +83,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1, help="计时前的预热请求次数")
     parser.add_argument("--bench-num-requests", type=int, default=0)
     parser.add_argument("--bench-input-len", type=int, default=256)
+    parser.add_argument(
+        "--bench-long-input-len",
+        type=int,
+        default=0,
+        help=">0 时第一条请求用该输入长度，其余用 --bench-input-len（测长 prompt + 短请求并发）",
+    )
     parser.add_argument("--bench-output-len", type=int, default=32)
     parser.add_argument("--bench-mixed", action="store_true", help="输入长度在 1/4..全长度间随机")
     parser.add_argument("--bench-serial", action="store_true", help="额外测逐条串行吞吐")
@@ -77,10 +99,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.page_size < 1:
         parser.error("--page-size must be >= 1")
-    if args.max_tokens < 0 or args.bench_output_len < 0:
+    if args.max_tokens < 0 or args.bench_output_len < 0 or args.bench_long_input_len < 0:
         parser.error("token counts must be >= 0")
     if args.max_running_req < 1:
         parser.error("--max-running-req must be >= 1")
+    if args.max_extend_tokens < 1:
+        parser.error("--max-prefill-length must be >= 1")
     if args.warmup < 0:
         parser.error("--warmup must be >= 0")
     return args
@@ -113,6 +137,7 @@ def _meta(args: argparse.Namespace, llm: LLM) -> dict[str, Any]:
         "num_pages": llm.engine.num_pages,
         "max_running_req": llm.engine.max_running_req,
         "max_extend_tokens": llm.scheduler.prefill_manager.max_extend_tokens,
+        "sched_policy": llm.scheduler.sched_policy,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
         "cuda_device": torch.cuda.get_device_name(0) if args.device.startswith("cuda") else None,
@@ -128,7 +153,8 @@ def _log_header(args: argparse.Namespace, meta: dict[str, Any], title: str) -> l
         f"- 模型 / dtype: `{meta['model']}` / {meta['dtype']}（{meta['model_source']}）",
         f"- KV cache / 调度: page_size={meta['page_size']}, num_pages={meta['num_pages']}, "
         f"max_running_req={meta['max_running_req']}, "
-        f"max_extend_tokens={meta['max_extend_tokens']}, cache={args.cache_type}",
+        f"max_extend_tokens={meta['max_extend_tokens']}, "
+        f"sched_policy={meta['sched_policy']}, cache={args.cache_type}",
         f"- warmup: {args.warmup} 次（不计时）",
     ]
 
@@ -238,7 +264,10 @@ def _make_bench_requests(
     rng = random.Random(args.seed)
     low = max(1, args.bench_input_len // 4)
     prompts: list[list[int]] = []
-    for _ in range(args.bench_num_requests):
+    if args.bench_long_input_len > 0:
+        # 第一条请求承担长 prompt，其余保持短输入，用来观察 chunk 与 decode 交错
+        prompts.append([token_id] * args.bench_long_input_len)
+    for _ in range(args.bench_num_requests - len(prompts)):
         length = (
             rng.randint(low, args.bench_input_len) if args.bench_mixed else args.bench_input_len
         )
@@ -325,8 +354,9 @@ def format_bench_entry(
     meta: dict,
 ) -> str:
     lines = _log_header(args, meta, "连续批处理并发压测")
+    long_note = f"首条 {args.bench_long_input_len} + " if args.bench_long_input_len else ""
     load = (
-        f"{args.bench_num_requests} 条请求，输入长度 "
+        f"{args.bench_num_requests} 条请求，输入长度 {long_note}"
         f"{'1/4..' if args.bench_mixed else ''}{args.bench_input_len}，"
         f"输出 {args.bench_output_len}"
     )
@@ -371,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
         num_pages=args.num_pages or None,
         max_seq_len=args.max_seq_len or None,
         max_extend_tokens=args.max_extend_tokens,
+        sched_policy=args.sched_policy,
         memory_ratio=args.memory_ratio,
         cache_type=args.cache_type,
         record_prefill_logits=not bench,

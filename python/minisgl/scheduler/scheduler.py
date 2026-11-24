@@ -17,9 +17,11 @@ from minisgl.env import ENV
 from .batch import prepare_batch
 from .cache import CacheManager
 from .decode import DecodeManager
-from .prefill import PrefillManager
+from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 from .utils import RequestState
+
+SCHED_POLICIES = ("prefill_first", "decode_first", "interleave")
 
 
 class Scheduler:
@@ -31,10 +33,16 @@ class Scheduler:
         cache_type: str = "naive",
         eos_token_id: int | None = None,
         record_prefill_logits: bool = False,
+        sched_policy: str = "prefill_first",
     ) -> None:
+        if sched_policy not in SCHED_POLICIES:
+            raise ValueError(f"sched_policy must be one of {SCHED_POLICIES}, got {sched_policy!r}")
         self.engine = engine
         self.eos_token_id = eos_token_id
         self.record_prefill_logits = record_prefill_logits
+        self.sched_policy = sched_policy
+        self._prefer_prefill = True
+        self.last_phase: str | None = None
 
         self.table_manager = TableManager(engine.max_running_req, engine.page_table)
         self.cache_manager = CacheManager(
@@ -106,15 +114,35 @@ class Scheduler:
         self.states.clear()
 
     # ------------------------------------------------------------------ 主循环
+    def _schedule_batch(self) -> Batch | None:
+        prefill_ready = self.prefill_manager.runnable
+        decode_ready = self.decode_manager.runnable
+        if not prefill_ready:
+            return self.decode_manager.schedule_next_batch() if decode_ready else None
+        if not decode_ready or self.sched_policy == "prefill_first":
+            prefill_batch = self.prefill_manager.schedule_next_batch()
+            return prefill_batch or self.decode_manager.schedule_next_batch()
+        if self.sched_policy == "decode_first":
+            decode_batch = self.decode_manager.schedule_next_batch()
+            return decode_batch or self.prefill_manager.schedule_next_batch()
+
+        # interleave：两边都有活时交替，让 decode 插在两个 chunk 之间
+        prefer_prefill = self._prefer_prefill
+        self._prefer_prefill = not prefer_prefill
+        if prefer_prefill:
+            prefill_batch = self.prefill_manager.schedule_next_batch()
+            return prefill_batch or self.decode_manager.schedule_next_batch()
+        decode_batch = self.decode_manager.schedule_next_batch()
+        return decode_batch or self.prefill_manager.schedule_next_batch()
+
     def step(self) -> bool:
-        batch = self.prefill_manager.schedule_next_batch()
-        if batch is None:
-            batch = self.decode_manager.schedule_next_batch()
+        batch = self._schedule_batch()
         if batch is None:
             if ENV.CHECK_INTEGRITY and self.is_idle:
                 self.cache_manager.check_integrity()
             return False
 
+        self.last_phase = batch.phase
         # 写回位置在 forward 前确定：采样出的 token 供下一次 decode 读取
         write_positions = [req.device_len for req in batch.reqs]
         self.cache_manager.allocate_paged(batch.reqs)
@@ -126,8 +154,10 @@ class Scheduler:
 
         if batch.is_prefill:
             for req in batch.reqs:
-                if not self.states[req.uid].finished:
-                    self.decode_manager.add_req(req)
+                # chunked 请求还没完成 prefill，继续留在 pending 队列
+                if isinstance(req, ChunkedReq) or self.states[req.uid].finished:
+                    continue
+                self.decode_manager.add_req(req)
         return True
 
     def run_until_complete(self) -> None:
@@ -160,9 +190,14 @@ class Scheduler:
         if batch.is_prefill and self.record_prefill_logits:
             logits = output.logits.float().cpu()
             for index, req in enumerate(batch.reqs):
+                if isinstance(req, ChunkedReq):
+                    continue
                 self.states[req.uid].prefill_logits = logits[index]
 
         for index, req in enumerate(batch.reqs):
+            if isinstance(req, ChunkedReq):
+                # 中间 chunk 不采样、不产出 token，也不推进请求状态
+                continue
             state = self.states[req.uid]
             token = int(tokens[index])
             if req.output_len == 0:
@@ -189,8 +224,10 @@ class Scheduler:
 
         if batch.is_prefill:
             for req in batch.reqs:
-                if not self.states[req.uid].finished:
-                    self.cache_manager.cache_req(req, finished=False)
+                # chunked 请求只有完整 prefill 结束后才插入前缀缓存
+                if isinstance(req, ChunkedReq) or self.states[req.uid].finished:
+                    continue
+                self.cache_manager.cache_req(req, finished=False)
 
     def _finish(self, req: Req, state: RequestState, reason: str, now: float) -> None:
         state.stop_reason = reason

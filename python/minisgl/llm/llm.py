@@ -46,6 +46,7 @@ class LLM:
         eos_token_id: int | None = None,
         tokenizer: Any = None,
         record_prefill_logits: bool = False,
+        sched_policy: str = "prefill_first",
     ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
@@ -96,6 +97,7 @@ class LLM:
             cache_type=cache_type,
             eos_token_id=eos_token_id,
             record_prefill_logits=record_prefill_logits,
+            sched_policy=sched_policy,
         )
         self.model_path = path
 

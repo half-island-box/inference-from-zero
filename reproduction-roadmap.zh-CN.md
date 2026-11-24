@@ -860,6 +860,82 @@ python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
 - chunk 边界跨越页边界时输出正确。
 - 与阶段 3 相比：长 prompt 场景的 ITL p99 明显下降；短 prompt 场景吞吐不应明显退化。
 
+**阶段架构图**
+
+```mermaid
+flowchart TB
+    subgraph PENDING["PendingReq 队列（FCFS）"]
+        P["input_ids<br/>chunked_req?"]
+    end
+
+    subgraph ADMIT["PrefillAdder（每个 iteration 重置 token budget）"]
+        CONT{"已有 chunked_req？"} -->|"是"| REUSE["复用 table_idx / cached_len / handle<br/>不再 match_prefix、不再做容量准入"]
+        CONT -->|"否"| NEW["表槽 → match_prefix → lock<br/>容量 = extend + output + 页尾浪费"]
+        NEW --> COPY["page_table[:cached_len] ← matched indices"]
+        COPY --> CHUNK
+        REUSE --> CHUNK["chunk = min(token_budget, remain_len)<br/>chunk < remain_len → ChunkedReq"]
+        CHUNK --> WRITE["token_pool 写入本 chunk 的 token<br/>budget -= chunk<br/>预留下整段剩余输入 + 输出"]
+    end
+
+    subgraph SCHED["Scheduler（每个 iteration）"]
+        POL{"prefill / decode 都可运行？"}
+        POL -->|"prefill_first"| PF["一个 prefill chunk"]
+        POL -->|"decode_first"| DC["一个 decode batch"]
+        POL -->|"interleave"| ALT["交替：chunk 之间插入 decode"]
+        PF --> PREP
+        DC --> PREP
+        ALT --> PREP
+        PREP["allocate_paged → prepare_batch<br/>positions / input_ids / out_loc → metadata"] --> ENGINE["Engine.forward_batch<br/>采样结果只对完整 Req 有效"]
+    end
+
+    subgraph RESULT["结果处理"]
+        ENGINE --> SKIP["ChunkedReq：<br/>不追加 token / 不写 token_pool<br/>不 cache_req / 不进 DecodeManager"]
+        ENGINE --> DONE["完整 prefill 的 Req：<br/>进入 DecodeManager + cache_req(finished=False)"]
+        ENGINE --> FIN["EOS / max_tokens：<br/>TableManager.free + cache_req(finished=True)"]
+    end
+
+    P --> ADMIT
+    WRITE --> SCHED
+    SKIP -->|"pending.chunked_req 留在队首"| PENDING
+```
+
+> 默认 `prefill_first` 与阶段 3 行为一致；`--sched-policy interleave` 在 prefill 与 decode 同时可运行时交替调度，用来兑现「长 prompt 场景 ITL p99 下降」。`ChunkedReq` 的 `input_ids` 截断到当前 chunk 末尾，`complete_one()` 后只保留 `cached_len` 供下一轮续算。
+
+**测试命令**
+
+```bash
+# 0. CPU：分块语义（chunk 预算 / page_size / 页边界 / 中止 / 交错调度 / 活锁）
+pytest tests/test_chunked_prefill.py -q
+
+# 1. 全量 CPU 回归（含阶段 1–3）
+pytest -q -m "not gpu"
+
+# 2. GPU：分块预填充生成，与阶段 0 黄金基线逐 token / logits 对比
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --model-source modelscope --page-size 16 --max-prefill-length 2048 --warmup 1
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/continuous/Qwen__Qwen3-0.6B/golden.json
+pytest tests/test_continuous_generation.py -m "gpu and slow"
+
+# 3. GPU：chunk size 消融（512 / 2048 / 8192），interleave 让 decode 插入 chunk 之间
+for chunk in 512 2048 8192; do
+  python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+      --page-size 16 --max-running-req 50 --max-prefill-length $chunk \
+      --sched-policy interleave --bench-num-requests 16 \
+      --bench-input-len 4096 --bench-output-len 32 --bench-mixed \
+      --warmup 1 --append-log --log-stage 4 \
+      --log-note "阶段 4 chunk=$chunk 长 prompt + 并发 decode"
+done
+
+# 4. GPU：32k prompt + 8 并发 decode（首条长请求，其余短路；不 OOM、输出正确）
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --page-size 16 --max-running-req 9 --max-prefill-length 2048 \
+    --sched-policy interleave --bench-num-requests 9 \
+    --bench-long-input-len 32768 --bench-input-len 64 --bench-output-len 8 \
+    --warmup 1 --append-log --log-stage 4 \
+    --log-note "阶段 4 32k prompt + 8 并发 decode"
+```
+
 **常见坑**
 
 - 对 `ChunkedReq` 做采样或发送输出。

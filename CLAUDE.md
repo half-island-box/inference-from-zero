@@ -14,12 +14,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 本仓库是**从零复现 mini-sglang 推理引擎**的工程，按 [reproduction-roadmap.zh-CN.md](reproduction-roadmap.zh-CN.md) 分 13 个阶段（阶段 0–12）推进。路线图是唯一的规格来源：每个阶段的目标、要实现的模块、验收标准、常见坑都在里面，动手前先读对应阶段。
 
 - **参考实现（只读）**：`/Users/bj/Coding/github/mini-sglang`（upstream `sgl-project/mini-sglang`，当前 `9a91cfa`）。其中 `docs/features.zh-CN.md`、`docs/structures.zh-CN.md`、`docs/reproduction-roadmap.zh-CN.md` 是本地未提交的中文文档。
-- **当前状态**：阶段 0 脚手架完成；阶段 1 最小生成器、阶段 2（`nn.Module`、KV Cache、批量前向、Paged Attention）、阶段 3（连续批处理、每请求采样、离线 LLM）的代码与 CPU 测试完成。阶段 1–3 的 GPU 验收仍需在 GPU 主机上运行黄金基线对比与压测。
+- **当前状态**：阶段 0 脚手架完成；阶段 1 最小生成器、阶段 2（`nn.Module`、KV Cache、批量前向、Paged Attention）、阶段 3（连续批处理、每请求采样、离线 LLM）、阶段 4（chunked prefill、`--sched-policy`）的代码与 CPU 测试完成。阶段 1–4 的 GPU 验收仍需在 GPU 主机上运行黄金基线对比与压测。
 - 代码应写在**本仓库**；参考仓库只用于卡住后对照接口和关键函数，不要整段搬运。先自己写，再 diff。
 
 ## 运行环境
 
 - 运行时**必须** Linux + NVIDIA GPU：`sgl_kernel`、`flashinfer`、`tvm-ffi` JIT 都依赖 CUDA，macOS/Windows 原生不行。参考仓库根目录有 `Dockerfile`。
+- 实验服务器驱动为 CUDA 12.8，安装时必须带 `--torch-backend=cu128`（或 `export UV_TORCH_BACKEND=cu128`），否则 uv 会装 PyPI 上由更新 CUDA 编译的 torch，运行时报 “NVIDIA driver too old”。
 - 本工作区是 macOS：可以写代码、跑纯 CPU 逻辑和 lint，但任何 `import torch` + CUDA kernel 的验证都要在 GPU 机器/容器上执行。
 - Python 3.10–3.12，包管理用 `uv`。
 - 首个目标模型：`Qwen/Qwen3-0.6B`（bf16，GQA + QK Norm）。默认从 ModelScope 下载；如需改用 HuggingFace，加 `--model-source huggingface`。两者统一下载到 `~/data`（`MINISGL_MODEL_DIR` 可覆盖）。
@@ -61,7 +62,9 @@ tests/test_paged_generation.py # 阶段 2 GPU 验收
 tests/test_generate_paged_log.py # 阶段 2 日志格式（CPU）
 tests/test_sampler.py          # 阶段 3 每请求采样（CPU）
 tests/test_continuous_scheduler.py # 阶段 3 连续批处理语义（CPU）
-tests/test_continuous_generation.py # 阶段 3 GPU 验收
+tests/test_continuous_generation.py # 阶段 3/4 GPU 验收
+tests/test_chunked_prefill.py  # 阶段 4 分块预填充语义（CPU）
+tests/test_model_dir.py        # 模型下载目录解析（CPU）
 experiments/log.md       # 每次实验记录
 out/                     # 基线/基准输出（gitignored，可在 GPU 主机重新生成）
 ```
@@ -70,7 +73,7 @@ out/                     # 基线/基准输出（gitignored，可在 GPU 主机�
 
 ```bash
 uv venv --python=3.12 && source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev]" --torch-backend=cu128   # GPU 主机；macOS 本地只跑 CPU 测试可省略
 
 pytest                                  # 全部测试（无 GPU 时 gpu 用例自动跳过）
 pytest tests/test_compare.py -q         # CPU 单测，本机可直接跑

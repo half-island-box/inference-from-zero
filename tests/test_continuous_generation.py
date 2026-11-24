@@ -36,6 +36,7 @@ def _build_llm(
     needed_tokens: int,
     max_seq_len: int,
     record_prefill_logits: bool,
+    max_extend_tokens: int = 8192,
 ) -> LLM:
     model_name = os.environ.get("GOLDEN_MODEL", payload["meta"]["model"])
     model_source = os.environ.get("MODEL_SOURCE", "modelscope")
@@ -65,13 +66,12 @@ def _build_llm(
         max_running_req=max_running_req,
         num_pages=num_pages,
         max_seq_len=max_seq_len,
+        max_extend_tokens=max_extend_tokens,
         record_prefill_logits=record_prefill_logits,
     )
 
 
-@pytest.mark.gpu
-@pytest.mark.slow
-def test_continuous_matches_golden() -> None:
+def _check_golden(max_extend_tokens: int) -> None:
     payload, golden_path = _load_payload()
     cases = payload["cases"]
     sampling = payload["sampling"]
@@ -84,6 +84,7 @@ def test_continuous_matches_golden() -> None:
         needed_tokens=needed,
         max_seq_len=max_seq_len,
         record_prefill_logits=True,
+        max_extend_tokens=max_extend_tokens,
     )
     golden_logits = np.load(golden_path.parent / payload.get("logits_file", "logits.npz"))
 
@@ -112,6 +113,19 @@ def test_continuous_matches_golden() -> None:
                 failures.append(f"{case['id']}: logits max diff {diff:.3e}")
 
     assert not failures, "\n".join(failures)
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_continuous_matches_golden() -> None:
+    _check_golden(max_extend_tokens=8192)
+
+
+@pytest.mark.gpu
+@pytest.mark.slow
+def test_chunked_prefill_matches_golden() -> None:
+    # chunk 预算小于 prompt 长度，强制走 ChunkedReq 路径
+    _check_golden(max_extend_tokens=16)
 
 
 @pytest.mark.gpu
