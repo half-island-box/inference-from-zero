@@ -62,6 +62,26 @@
 
 - 结论 / 下一步: 阶段 0 黄金基线
 
+### 2026-11-24 — bench: short_32, medium_512x8, long_8k, long_32k, shared_prefix_4k, burst_32, mixed_lengths （阶段 0）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: cuda:5 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- 配置: backend=hf, seed=0, warmup=1
+- 负载: short_32, medium_512x8, long_8k, long_32k, shared_prefix_4k, burst_32, mixed_lengths
+
+| 负载 | 请求数 | 输入长度 | 输出长度 | TTFT p50 (ms) | ITL p50 (ms) | ITL p95 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| short_32 | 1 | 32 | 32 | 68.62 | 34.96 | 37.17 | 38.25 | 28.89 | 0.00 |
+| medium_512x8 | 8 | 512 | 64 | 77.25 | 33.59 | 37.06 | 42.70 | 29.14 | 0.00 |
+| long_8k | 1 | 8192 | 32 | 594.61 | 33.17 | 37.10 | 37.19 | 19.78 | 0.00 |
+| long_32k | 1 | 32768 | 16 | 5213.70 | 39.03 | 49.41 | 49.98 | 2.76 | 0.00 |
+| shared_prefix_4k | 2 | 4352 | 32 | 286.00 | 34.44 | 36.69 | 37.74 | 24.21 | 0.00 |
+| burst_32 | 32 | 128 | 32 | 70.48 | 33.66 | 37.28 | 42.59 | 29.06 | 0.00 |
+| mixed_lengths | 8 | 32–4096 | 16–128 | 79.34 | 33.85 | 37.79 | 45.67 | 28.30 | 0.00 |
+
+- 结论 / 下一步: 阶段 0 黄金基线
+
 ## 阶段 1：最小生成器
 
 ### 2026-11-19 — 代码与 CPU 测试完成（待 GPU 验收）
@@ -115,11 +135,117 @@
 
 ## 阶段 2：KV Cache 与批量前向
 
-（待开始）
+### 2026-11-24 — paged decode 随 batch size 扩展 （阶段 2）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache: page_size=16, max_running_req=8
+- warmup: 1 次/配置（不计时）
+- 配置: 固定 prompt 长度 256，max_tokens=32；greedy，ignore_eos=True
+
+| batch size | prefill (ms) | decode 均值 (ms) | 峰值显存 (GB) |
+| --- | --- | --- | --- |
+| 1 | 52.02 | 43.77 | 0.00 |
+| 2 | 53.26 | 47.62 | 0.00 |
+| 4 | 60.86 | 58.53 | 0.00 |
+| 8 | 94.77 | 78.85 | 0.00 |
+
+- 结论 / 下一步: 阶段 2 batch 扩展
+
+### 2026-11-24 — paged decode 随序列长度扩展 （阶段 2）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache: page_size=16, max_running_req=8
+- warmup: 1 次/配置（不计时）
+- 配置: batch size=1，max_tokens=32；greedy，ignore_eos=True
+
+| prompt 长度 | prefill (ms) | decode 均值 (ms) | 峰值显存 (GB) |
+| --- | --- | --- | --- |
+| 128 | 42.17 | 45.19 | 0.00 |
+| 256 | 43.20 | 41.27 | 0.00 |
+| 512 | 69.03 | 40.97 | 0.00 |
+| 1024 | 77.34 | 41.24 | 0.00 |
+
+- 结论 / 下一步: 阶段 2 序列长度扩展
+
+### 2026-11-24 — paged KV Cache 批量生成 （阶段 2）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache: page_size=16, max_running_req=8
+- warmup: 1 次/配置（不计时）
+- 配置: max_tokens=32, ignore_eos=False, batch≤8, 20 条固定 prompt（3 个 batch）
+- 结果: prefill 均值 = 69.07 ms；单步 decode 均值 = 68.37 ms；峰值显存 = 0.00 GB
+
+- 结论 / 下一步: 阶段 2 批量生成验收
 
 ## 阶段 3：连续批处理调度器
 
-（待开始）
+### 2026-11-24 — 连续批处理并发压测 （阶段 3）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=8192, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 200 条请求，输入长度 1/4..256，输出 32；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 200 | 38.41 | 15071.76 | 29185.40 | 291.05 | 378.64 | 166.64 | 0.00 |
+| 串行 | 200 | 269.98 | 41.54 | 49.04 | 40.21 | 54.08 | 23.71 | 0.00 |
+- 相对串行加速: 7.03×
+
+- 结论 / 下一步: 阶段 3 连续批处理并发 vs 串行
+
+### 2026-11-24 — 连续批处理并发压测 （阶段 3）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=8192, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 1000 条请求，输入长度 1/4..128，输出 16；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 1000 | 96.91 | 46539.50 | 87936.83 | 282.36 | 384.82 | 165.09 | 0.00 |
+
+- 结论 / 下一步: 阶段 3 1000 请求压测
+
+### 2026-11-24 — 连续批处理并发压测 （阶段 3）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=8192, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 1000 条请求，输入长度 1/4..128，输出 16；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 1000 | 91.39 | 43787.99 | 82715.00 | 281.72 | 332.76 | 175.08 | 0.00 |
+
+- 结论 / 下一步: 阶段 3 1000 请求压测
+
+### 2026-11-24 — 连续批处理并发压测 （阶段 3）
+
+- commit: 6ee3af2 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=8192, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 1000 条请求，输入长度 1/4..128，输出 16；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 1000 | 99.95 | 47702.35 | 90576.74 | 308.72 | 351.57 | 160.09 | 0.00 |
+
+- 结论 / 下一步: 阶段 3 1000 请求压测
 
 ## 阶段 4：分块预填充
 
