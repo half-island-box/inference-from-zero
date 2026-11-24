@@ -717,6 +717,97 @@ while True:
 - `max_running_req` 生效；超过上限的请求排队而不是报错。
 - temperature=0 / top_k=1 / top_p<1 等采样配置行为正确。
 
+**阶段架构图**
+
+```mermaid
+flowchart TB
+    subgraph API["离线接口"]
+        GEN["LLM.generate(prompts, sampling_params)"] --> ADD["Scheduler.add_request<br/>uid + RequestState"]
+        ADD --> INCOMING["PrefillManager.pending_list"]
+        ABORT["LLM / Scheduler.abort_request"] --> REMOVE["从 pending / running 移除"]
+    end
+
+    subgraph SCHED["Scheduler（每个 iteration）"]
+        PICK{"pending 有请求？"} -->|"是"| PF["PrefillManager.schedule_next_batch<br/>FCFS + token budget + 容量准入"]
+        PICK -->|"否"| DC["DecodeManager.schedule_next_batch<br/>running 按 uid 排序"]
+        PF --> PREP["allocate_paged → prepare_batch<br/>positions / input_ids / out_loc → metadata"]
+        DC --> PREP
+        PREP --> ENGINE["Engine.forward_batch"]
+        ENGINE --> RESULT["处理采样结果<br/>追加 token / 写回 token_pool / complete_one"]
+        RESULT -->|"未完成"| DC
+        RESULT -->|"EOS / max_tokens"| FREE["TableManager.free + cache_req(finished=True)<br/>槽位与页回收"]
+    end
+
+    subgraph ADMIT["准入控制（PrefillAdder）"]
+        SLOT["table slot 足够？"] --> MATCH["match_prefix（naive 阶段不命中）"]
+        MATCH --> CAP["extend + output + inflight_tokens<br/>≤ available_size？"]
+        CAP --> LOCK["lock handle + 分配 table_idx<br/>拷贝 prompt token"]
+    end
+    INCOMING --> PICK
+    CAP --> PF
+
+    subgraph ENG["Engine"]
+        MODEL["model.forward()<br/>paged attention + KV store"] --> LOGITS["取每个请求 last logits"]
+        LOGITS --> SAMPLE["Sampler<br/>全 greedy → argmax 快路径<br/>否则 per-request temp/top_k/top_p"]
+        SAMPLE --> COMPLETE["complete_one()<br/>cached_len = device_len; device_len += 1"]
+    end
+    ENGINE --- ENG
+
+    subgraph SAMPLE_IMPL["采样实现"]
+        G["Sampler.prepare<br/>全 greedy 不建张量"] --> S["torch.multinomial<br/>统一在 GPU 批量完成"]
+    end
+    SAMPLE --- SAMPLE_IMPL
+
+    subgraph CACHE["管理器"]
+        TABLE["TableManager<br/>请求槽位 + token_pool"]
+        CACHEM["CacheManager<br/>页分配 / 释放 / 完整性检查"]
+        DEC["DecodeManager<br/>running 集合 + inflight_tokens"]
+    end
+    SCHED --> CACHE
+
+    FREE --> IDLE{"完全空闲？"}
+    IDLE -->|"是"| CHECK["check_integrity<br/>free_pages == num_pages"]
+    PICK -->|"否且无 running"| IDLE
+```
+
+> 阶段 3 的 prefill 不分块：单个请求可以超过 `max_extend_tokens`，避免活锁；分块与 decode 交错留到阶段 4。所有请求共享同一个 `Scheduler` 和 `Engine`，每个 iteration 重新组 batch。`ChunkedReq` 类型已预留但未启用。
+
+**测试命令**
+
+```bash
+# 0. CPU：采样器单测（greedy 快路径 / top_k / top_p / temperature）
+pytest tests/test_sampler.py -q
+
+# 1. CPU：连续批处理（50 条混合请求、动态加入、中止、容量准入、page_size）
+pytest tests/test_continuous_scheduler.py -q
+
+# 2. 全量 CPU 回归（含阶段 1/2）
+pytest -q -m "not gpu"
+
+# 3. GPU：连续批处理生成，与阶段 0 黄金基线逐 token / logits 对比
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --model-source modelscope --page-size 16 --warmup 1
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/continuous/Qwen__Qwen3-0.6B/golden.json
+pytest tests/test_continuous_generation.py -m "gpu and slow"
+
+# 4. GPU：50 并发混合长度压测 + 串行基线，写入 log.md 阶段 3
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --page-size 16 --max-running-req 50 --bench-num-requests 200 \
+    --bench-input-len 256 --bench-output-len 32 --bench-mixed \
+    --bench-serial --warmup 1 --append-log --log-stage 3 \
+    --log-note "阶段 3 连续批处理并发 vs 串行"
+
+# 5. GPU：1000 条请求连续压测，验证完整性与显存不增长
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --page-size 16 --max-running-req 50 --bench-num-requests 1000 \
+    --bench-input-len 128 --bench-output-len 16 --bench-mixed \
+    --warmup 1 --append-log --log-stage 3 \
+    --log-note "阶段 3 1000 请求压测"
+```
+
+> `--bench-serial` 会用同一个 LLM 逐条运行同一组请求，自动在日志中给出相对串行加速比。中止路径由 CPU 测试 `test_dynamic_arrival_and_abort` 覆盖。
+
 **常见坑**
 
 - 结束判断放在追加 token 之前/之后不一致，导致少输出一个 token。

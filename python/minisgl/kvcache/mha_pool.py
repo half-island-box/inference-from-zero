@@ -46,9 +46,12 @@ class MHAKVCache(BaseKVCachePool):
         self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int
     ) -> None:
         # 先扁平化成按物理 token 槽位索引的视图，再写入本轮 K/V
+        # -> (num_pages * page_size, num_kv_heads, head_dim) 一维物理寻址
         shape = (-1, self._num_kv_heads, self._head_dim)
         k_cache = self._k_buffer[layer_id].view(shape)
         v_cache = self._v_buffer[layer_id].view(shape)
+
+        # out_loc[i]表第i个token 的 物理下标
         indices = out_loc.to(torch.long)
         k_cache.index_copy_(0, indices, k.reshape(shape).to(k_cache.dtype))
         v_cache.index_copy_(0, indices, v.reshape(shape).to(v_cache.dtype))

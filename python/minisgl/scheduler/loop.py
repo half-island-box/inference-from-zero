@@ -11,25 +11,15 @@ from dataclasses import dataclass, field
 
 import torch
 
-from minisgl.attention import BaseAttnBackend, create_attention_backend
-from minisgl.core import (
-    Batch,
-    Context,
-    Req,
-    SamplingParams,
-    set_global_ctx,
-)
+from minisgl.attention import BaseAttnBackend
+from minisgl.core import Batch, Req, SamplingParams
+from minisgl.engine import Engine
 from minisgl.engine.sample import greedy_sample
-from minisgl.kvcache import create_kvcache_pool
 from minisgl.models import BaseLLMModel, ModelConfig
 
 from .batch import prepare_batch
 from .cache import CacheManager
 from .table import TableManager
-
-
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
 
 
 @dataclass
@@ -74,42 +64,33 @@ class PagedEngine:
         dtype: torch.dtype = torch.float32,
         attn_backend: BaseAttnBackend | None = None,
     ) -> None:
-        self.device = torch.device(device)
-        self.model = model
-        self.page_size = page_size
-        self.max_running_req = max_running_req
-        self.max_seq_len = min(
-            max_seq_len or config.rotary_config.max_position, num_pages * page_size
-        )
-        aligned_max_seq_len = _align_up(self.max_seq_len, 32)
-
-        self.ctx = Context(page_size=page_size)
-        self.kv_cache = create_kvcache_pool(
+        # Engine 负责模型、KV 池、页表与 attention backend；本类只做静态 batch 驱动
+        self.engine = Engine(
+            model,
             config,
             num_pages=num_pages,
             page_size=page_size,
+            max_running_req=max_running_req,
+            max_seq_len=max_seq_len,
+            device=device,
             dtype=dtype,
-            device=self.device,
+            attn_backend=attn_backend,
         )
-        # +1 行 dummy 请求；dummy 页从 num_pages * page_size 开始
-        self.page_table = torch.zeros(
-            (max_running_req + 1, aligned_max_seq_len),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.page_table[max_running_req].fill_(num_pages * page_size)
-
-        self.ctx.page_table = self.page_table
-        self.ctx.kv_cache = self.kv_cache
-        self.ctx.attn_backend = attn_backend or create_attention_backend("torch")
-        set_global_ctx(self.ctx, force=True)
+        self.device = self.engine.device
+        self.model = model
+        self.page_size = page_size
+        self.max_running_req = max_running_req
+        self.max_seq_len = self.engine.max_seq_len
+        self.ctx = self.engine.ctx
+        self.kv_cache = self.engine.kv_cache
+        self.page_table = self.engine.page_table
+        self.num_pages = num_pages
 
         self.table_manager = TableManager(max_running_req, self.page_table)
         self.cache_manager = CacheManager(num_pages, page_size, self.page_table, type="naive")
-        self.num_pages = num_pages
         self.token_pool = self.table_manager.token_pool
 
-    # ------------------------------------------------------------------ 主循环
+    # ---------------------------------- 主循环
     def generate(
         self,
         requests: list[BatchRequest],
@@ -183,8 +164,9 @@ class PagedEngine:
         self.cache_manager.allocate_paged(batch.reqs)
         prepare_batch(batch, self.page_table, self.token_pool)
         self.ctx.attn_backend.prepare_metadata(batch)
-        with self.ctx.forward_batch(batch):
-            logits = self.model.forward()
+
+        logits = self.engine.forward_logits(batch)
+
         metadata = batch.attn_metadata
         assert metadata is not None
         return logits[metadata.get_last_indices(batch.size)]

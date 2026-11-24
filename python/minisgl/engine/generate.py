@@ -23,7 +23,7 @@ class GenerationStats:
     decode_ms: list[float] = field(default_factory=list)
 
     @property
-    def mean_decode_ms(self) -> float | None: # 平均的decode时长，  
+    def mean_decode_ms(self) -> float | None: # 平均的decode时长，
         return sum(self.decode_ms) / len(self.decode_ms) if self.decode_ms else None
 
 
@@ -88,9 +88,9 @@ def naive_generate(
         # 进行一次decode
         _sync(device)
         start = time.perf_counter()
-        logits = model.forward(ids, logits_to_keep=1) 
+        logits = model.forward(ids, logits_to_keep=1)
         _sync(device)
-        
+
         stats.decode_ms.append((time.perf_counter() - start) * 1e3)
         last_logits = logits[0, -1]
 

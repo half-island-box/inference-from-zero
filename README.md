@@ -11,6 +11,7 @@
 | 0 环境与黄金基线 | 脚手架完成，待在 GPU 上生成基线 | `tools/` + `tests/` + `experiments/log.md` |
 | 1 最小生成器 | 代码与 CPU 测试完成，待在 GPU 上验收 | `python/minisgl/` + `scripts/generate_naive.py` |
 | 2 KV Cache / 批量前向 | 代码与 CPU 测试完成，待在 GPU 上验收 | `kvcache/` + `attention/` + `scheduler/` + `scripts/generate_paged.py` |
+| 3 连续批处理 | 代码与 CPU 测试完成，待在 GPU 上验收 | `scheduler/` + `engine/engine.py` + `llm/` + `scripts/generate_continuous.py` |
 
 ## 环境要求
 
@@ -140,6 +141,36 @@ python scripts/generate_paged.py --model Qwen/Qwen3-0.6B \
 
 `--warmup N`（默认 1）会在每个配置计时前用同形状请求预热 N 次，避免首个 batch 的 CUDA kernel 懒加载 / allocator 初始化开销（约 90–120 ms）进入 prefill 数字；`--warmup 0` 可复现未预热结果。
 
+## 阶段 3：连续批处理与每请求采样
+
+阶段 3 在阶段 2 的 paged KV 之上加入真正的连续批处理：
+
+- `Scheduler` 每个 iteration 重新决定本轮跑哪些请求：prefill 有 pending 就优先组 prefill batch，否则跑所有 running 请求的 decode batch；
+- `PrefillManager` 做 FCFS 准入，同时预留输入与未来输出，扣除 in-flight decode 的 `inflight_tokens`；
+- `DecodeManager` 维护 running 集合，decode batch 按 `uid` 排序；
+- `Engine` 负责模型、KV 池、页表与 `forward_batch`；`Sampler` 支持每请求 temperature / top_k / top_p，全 greedy 时走 argmax 快路径；
+- `LLM` 提供离线 `generate()`，支持请求动态加入、中止与 1000 请求压测。
+
+```bash
+# CPU：采样器 + 连续批处理（50 混合请求、动态加入、中止、容量准入）
+pytest tests/test_sampler.py tests/test_continuous_scheduler.py -q
+
+# GPU：连续批处理生成 + 黄金基线对比
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --model-source modelscope --page-size 16 --warmup 1
+python tools/compare.py --baseline out/golden/Qwen__Qwen3-0.6B/golden.json \
+                        --actual   out/continuous/Qwen__Qwen3-0.6B/golden.json
+pytest tests/test_continuous_generation.py -m "gpu and slow"
+
+# 50 并发混合长度 + 串行基线，写入 log.md 阶段 3
+python scripts/generate_continuous.py --model Qwen/Qwen3-0.6B \
+    --page-size 16 --max-running-req 50 --bench-num-requests 200 \
+    --bench-input-len 256 --bench-output-len 32 --bench-mixed \
+    --bench-serial --warmup 1 --append-log --log-stage 3
+```
+
+`--bench-serial` 会额外逐条运行同一组请求，日志中自动给出相对串行加速比；`--bench-num-requests 1000` 用于连续压测与完整性检查。
+
 ## 采样语义（后续所有阶段复用）
 
 - 每条请求最多生成 `max_tokens` 个 token；
@@ -156,11 +187,14 @@ python/minisgl/          # 自己的引擎实现
   models/                # 配置、Llama/Qwen3、safetensors 权重加载
   kvcache/               # KV 池（MHA）、前缀缓存接口、naive 前缀缓存
   attention/             # attention backend 接口与 torch 参考实现
-  scheduler/             # 请求槽位、页分配器、batch 组装、静态调度循环
-  engine/                # greedy 采样与 naive 生成循环
+  scheduler/             # 连续批处理：prefill/decode 管理、页分配、主循环
+  engine/                # Engine（forward_batch）、采样器、naive 生成循环
+  llm/                   # 离线 LLM.generate() 接口
+  env.py                 # MINISGL_* 环境变量开关
 scripts/
   generate_naive.py      # 阶段 1 生成/对比/序列长度 benchmark
   generate_paged.py      # 阶段 2 paged 批量生成/对比/batch·长度 benchmark
+  generate_continuous.py # 阶段 3 连续批处理生成/并发·串行压测
 tools/
   reference_hf.py        # 黄金基线：greedy 生成 + logits
   compare.py             # 与基线对比（token 精确 / logits 容差）
@@ -181,6 +215,9 @@ tests/
   test_paged_engine.py   # 批量生成与阶段 1 一致（CPU）
   test_paged_generation.py # 阶段 2 GPU 验收
   test_generate_paged_log.py # 阶段 2 日志格式（CPU）
+  test_sampler.py        # 每请求采样参数（CPU）
+  test_continuous_scheduler.py # 连续批处理语义（CPU）
+  test_continuous_generation.py # 阶段 3 GPU 验收
 experiments/log.md       # 实验记录
 ```
 
