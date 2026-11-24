@@ -249,7 +249,65 @@
 
 ## 阶段 4：分块预填充
 
-（待开始）
+### 2026-11-24 — 连续批处理并发压测 （阶段 4）
+
+- commit: a12d9a6 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:4) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=512, sched_policy=interleave, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 16 条请求，输入长度 1/4..4096，输出 32；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 16 | 10.51 | 4397.99 | 8245.84 | 111.83 | 147.14 | 48.70 | 4.21 |
+
+- 结论 / 下一步: 阶段 4 chunk=512 长 prompt + 并发 decode
+
+### 2026-11-24 — 连续批处理并发压测 （阶段 4）
+
+- commit: a12d9a6 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:4) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=2048, sched_policy=interleave, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 16 条请求，输入长度 1/4..4096，输出 32；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 16 | 8.10 | 2086.32 | 5826.04 | 82.10 | 252.49 | 63.18 | 4.68 |
+
+- 结论 / 下一步: 阶段 4 chunk=2048 长 prompt + 并发 decode
+
+### 2026-11-24 — 连续批处理并发压测 （阶段 4）
+
+- commit: a12d9a6 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:4) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=1526, max_running_req=50, max_extend_tokens=8192, sched_policy=interleave, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 16 条请求，输入长度 1/4..4096，输出 32；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 16 | 7.48 | 1218.54 | 4732.11 | 87.76 | 667.87 | 68.49 | 6.56 |
+
+- 结论 / 下一步: 阶段 4 chunk=8192 长 prompt + 并发 decode
+
+### 2026-11-24 — 连续批处理并发压测 （阶段 4）
+
+- commit: fd96108 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:4) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=7376, max_running_req=9, max_extend_tokens=2048, sched_policy=interleave, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 9 条请求，输入长度 首条 32768 + 64，输出 8；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 9 | 8.48 | 7744.26 | 7744.33 | 97.67 | 348.75 | 8.49 | 15.41 |
+
+- 结论 / 下一步: 阶段 4 32k prompt + 8 并发 decode
 
 ## 阶段 5：前缀缓存
 
