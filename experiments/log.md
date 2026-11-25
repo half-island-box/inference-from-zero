@@ -311,7 +311,50 @@
 
 ## 阶段 5：前缀缓存
 
-（待开始）
+### 2026-11-25 — 连续批处理并发压测 （阶段 5）
+
+- commit: 4a5e1b7 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:1) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=11606, max_running_req=16, max_extend_tokens=2048, sched_policy=prefill_first, cache=naive
+- warmup: 1 次（不计时）
+- 配置: 8 条请求，输入长度 共享前缀 4096 + 64，输出 16；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 8 | 3.32 | 1263.95 | 2030.31 | 75.88 | 1578.22 | 38.56 | 23.17 |
+
+- 结论 / 下一步: 阶段 5 4k 共享前缀 cache=naive
+
+### 2026-11-25 — 连续批处理并发压测 （阶段 5）
+
+- commit: 4a5e1b7 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:1) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=11606, max_running_req=16, max_extend_tokens=2048, sched_policy=prefill_first, cache=radix
+- warmup: 1 次（不计时）
+- 配置: 8 条请求，输入长度 共享前缀 4096 + 64，输出 16；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 8 | 1.87 | 672.92 | 674.41 | 75.34 | 141.79 | 68.29 | 23.17 |
+
+- 结论 / 下一步: 阶段 5 4k 共享前缀 cache=radix
+
+### 2026-11-25 — 连续批处理并发压测 （阶段 5）
+
+- commit: 4a5e1b7 (dirty)
+- GPU / 驱动 / torch / transformers: NVIDIA GeForce RTX 3090 (cuda:1) / driver 570.153.02 / torch 2.11.0+cu128 / transformers 4.57.3
+- 模型 / dtype: `Qwen/Qwen3-0.6B` / bfloat16（modelscope）
+- KV cache / 调度: page_size=16, num_pages=256, max_running_req=16, max_extend_tokens=8192, sched_policy=prefill_first, cache=radix
+- warmup: 1 次（不计时）
+- 配置: 200 条请求，输入长度 1/4..512，输出 32；greedy，ignore_eos=True
+
+| 模式 | 请求数 | wall (s) | TTFT p50 (ms) | TTFT p95 (ms) | ITL p50 (ms) | ITL p99 (ms) | tok/s | 峰值显存 (GB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 并发 | 200 | 47.89 | 22822.15 | 41828.34 | 114.47 | 136.62 | 133.65 | 2.81 |
+
+- 结论 / 下一步: 阶段 5 小显存压力淘汰
 
 ## 阶段 6：服务化
 
