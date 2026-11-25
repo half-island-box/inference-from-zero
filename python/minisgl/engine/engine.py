@@ -107,7 +107,9 @@ class Engine:
             next_tokens_cpu = torch.empty_like(next_tokens_gpu, device="cpu", pin_memory=True)
             next_tokens_cpu.copy_(next_tokens_gpu, non_blocking=True)
             copy_done_event = torch.cuda.Event()
-            copy_done_event.record()
+            # 必须记录在引擎实际设备的 stream 上：不带参数会落到 current_device
+            # （默认 0 号卡），既等错设备，也可能在 0 号卡已满时初始化其 context 触发 OOM
+            copy_done_event.record(torch.cuda.current_stream(self.device))
         else:
             next_tokens_cpu = next_tokens_gpu.cpu()
         return ForwardOutput(
